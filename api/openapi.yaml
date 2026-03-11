@@ -1,0 +1,220 @@
+openapi: 3.1.0
+info:
+  title: OpenInterstate API
+  version: 0.1.0
+  description: Read-only discovery and lookup API for OpenInterstate release data.
+servers:
+  - url: https://api.openinterstate.org
+paths:
+  /v1/releases:
+    get:
+      summary: List releases
+      operationId: listReleases
+      responses:
+        "200":
+          description: Releases
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  releases:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Release"
+                required: [releases]
+  /v1/releases/latest:
+    get:
+      summary: Get the latest release
+      operationId: getLatestRelease
+      responses:
+        "200":
+          description: Latest release
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Release"
+  /v1/corridors:
+    get:
+      summary: List corridors
+      operationId: listCorridors
+      parameters:
+        - in: query
+          name: interstate_name
+          schema:
+            type: string
+        - in: query
+          name: direction_code
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Corridors
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  corridors:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Corridor"
+                required: [corridors]
+  /v1/corridors/{corridor_id}:
+    get:
+      summary: Get a corridor by ID
+      operationId: getCorridor
+      parameters:
+        - in: path
+          name: corridor_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Corridor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Corridor"
+        "404":
+          description: Not found
+  /v1/exits/{exit_id}:
+    get:
+      summary: Get an exit by ID
+      operationId: getExit
+      parameters:
+        - in: path
+          name: exit_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Exit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Exit"
+        "404":
+          description: Not found
+  /v1/exits/{exit_id}/places:
+    get:
+      summary: List places linked to an exit
+      operationId: listExitPlaces
+      parameters:
+        - in: path
+          name: exit_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Places linked to an exit
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  exit_id:
+                    type: string
+                  places:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Place"
+                required: [exit_id, places]
+        "404":
+          description: Not found
+  /v1/reference-routes:
+    get:
+      summary: List reference routes
+      operationId: listReferenceRoutes
+      responses:
+        "200":
+          description: Reference routes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reference_routes:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ReferenceRoute"
+                required: [reference_routes]
+  /v1/reference-routes/{reference_route_id}:
+    get:
+      summary: Get a reference route by ID
+      operationId: getReferenceRoute
+      parameters:
+        - in: path
+          name: reference_route_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Reference route
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReferenceRoute"
+        "404":
+          description: Not found
+components:
+  schemas:
+    Release:
+      type: object
+      properties:
+        release_id:
+          type: string
+        release_date:
+          type: string
+          format: date
+        schema_version:
+          type: string
+      required: [release_id, release_date, schema_version]
+    Corridor:
+      type: object
+      properties:
+        corridor_id:
+          type: string
+        interstate_name:
+          type: string
+        direction_code:
+          type: string
+        direction_label:
+          type: string
+      required: [corridor_id, interstate_name, direction_code, direction_label]
+    Exit:
+      type: object
+      properties:
+        exit_id:
+          type: string
+        corridor_id:
+          type: string
+        exit_number:
+          type: string
+        exit_name:
+          type: string
+      required: [exit_id, corridor_id]
+    Place:
+      type: object
+      properties:
+        place_id:
+          type: string
+        name:
+          type: string
+        category:
+          type: string
+      required: [place_id, name]
+    ReferenceRoute:
+      type: object
+      properties:
+        reference_route_id:
+          type: string
+        corridor_id:
+          type: string
+        display_name:
+          type: string
+      required: [reference_route_id, corridor_id, display_name]
