@@ -20,6 +20,7 @@ Current priorities:
 2. lock the naming system
 3. document licensing and attribution requirements
 4. stand up release and contribution scaffolding
+5. publish the first real interstate dataset release
 
 ## Project Boundary
 
@@ -40,6 +41,7 @@ It does not define:
 - [Roadmap](docs/roadmap.md)
 - [Program status](docs/program_status.md)
 - [Licensing and attribution notes](docs/licensing_and_attribution.md)
+- [Release build guide](docs/release_build.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## Initial Scope
@@ -61,6 +63,7 @@ The initial public surface is expected to cover:
 2. Publish reproducible releases before committing to a public API.
 3. Keep the public data contract decoupled from any one downstream client.
 4. Treat licensing and attribution as first-class requirements.
+5. Prefer real release artifacts over mocked examples whenever feasible.
 
 ## Public Surfaces
 

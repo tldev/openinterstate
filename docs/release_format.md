@@ -50,15 +50,16 @@ The release manifest must include:
 
 ## Primary And Secondary Formats
 
-Primary format:
+Current v1 release formats:
 
-- GeoParquet
-
-Secondary formats:
-
-- FlatGeobuf
+- CSV for primary tabular datasets
 - GPX for reference routes
-- GeoJSON only for samples and small extracts
+- GeoJSON for small example extracts
+
+Planned follow-on formats:
+
+- Parquet / GeoParquet
+- FlatGeobuf
 
 ## Public Contract Rule
 
