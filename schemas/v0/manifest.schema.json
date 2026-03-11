@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openinterstate.org/schemas/v0/manifest.schema.json",
+  "title": "OpenInterstate Release Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "release_id": {
+      "type": "string"
+    },
+    "release_date": {
+      "type": "string",
+      "format": "date"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "source_lineage": {
+      "type": "string"
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string"
+          },
+          "sha256": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": ["path", "format", "sha256", "size_bytes"]
+      }
+    },
+    "attribution": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "release_id",
+    "release_date",
+    "schema_version",
+    "source_lineage",
+    "files",
+    "attribution"
+  ]
+}
