@@ -36,6 +36,9 @@ It does not define:
 - [Project charter](docs/charter.md)
 - [Naming glossary](docs/naming_glossary.md)
 - [Data contract draft](docs/data_contract_draft.md)
+- [Release format](docs/release_format.md)
+- [Roadmap](docs/roadmap.md)
+- [Program status](docs/program_status.md)
 - [Licensing and attribution notes](docs/licensing_and_attribution.md)
 - [Contributing](CONTRIBUTING.md)
 
@@ -58,3 +61,9 @@ The initial public surface is expected to cover:
 2. Publish reproducible releases before committing to a public API.
 3. Keep the public data contract decoupled from any one downstream client.
 4. Treat licensing and attribution as first-class requirements.
+
+## Public Surfaces
+
+1. Main project repo: `https://github.com/tldev/openinterstate`
+2. Website repo: `https://github.com/tldev/openinterstate.org`
+3. Planned public site: `https://openinterstate.org`

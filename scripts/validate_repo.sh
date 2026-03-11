@@ -12,6 +12,8 @@ required_files=(
   "docs/licensing_and_attribution.md"
   "docs/release_format.md"
   "docs/roadmap.md"
+  "docs/program_status.md"
+  "docs/external_blockers.md"
   "api/openapi.yaml"
   "schemas/v0/manifest.schema.json"
   "examples/duckdb/example_queries.sql"
