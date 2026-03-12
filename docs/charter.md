@@ -17,7 +17,7 @@ OpenInterstate aims to publish that derived layer openly.
 OpenInterstate will publish:
 
 1. directional interstate corridors
-2. normalized exits and exit aliases
+2. corridor exits and optional source-exit alias mappings
 3. linked places and reachability metadata
 4. reference routes for exploration, QA, and examples
 5. release manifests, checksums, and schema docs
@@ -31,6 +31,9 @@ OpenInterstate will not initially focus on:
 3. consumer app features
 4. broad non-interstate road coverage
 5. legal foundation setup
+
+The internal canonical database may still retain non-interstate road and POI
+context when that context is required to build the Interstate outputs.
 
 ## Relationship To Downstream Consumers
 

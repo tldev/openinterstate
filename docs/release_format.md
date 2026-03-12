@@ -2,6 +2,17 @@
 
 This document defines the intended structure of an OpenInterstate public release.
 
+Current v1 scope notes:
+
+1. the public release exports Interstate records only, including the supported
+   official branch routes `I-35E`, `I-35W`, `I-69C`, `I-69E`, and `I-69W`
+2. arbitrary `I-*` labels that are not treated as public Interstate route names
+   are excluded from the release
+3. `exit_aliases.csv` is part of the release layout, but may be empty until the
+   standalone alias-normalization layer is populated
+4. `reference_routes.csv` and `reference_routes.gpx.zip` are generated only for
+   corridors that meet the current route-builder thresholds
+
 ## Release Cadence
 
 Target starting cadence:

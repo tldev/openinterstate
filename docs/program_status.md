@@ -24,6 +24,8 @@ Date: 2026-03-12
 18. local pipeline reorganized around `bin/`, `schema/`, `crates/`, `docker/`, and `tooling/`
 19. single-command local build verified from a blank external data root on `/Volumes/goose-drive`
 20. release output root made configurable, with default local releases now written under the managed data root
+21. release export updated to include supported official branch Interstates (`I-35E`, `I-35W`, `I-69C`, `I-69E`, `I-69W`)
+22. latest standalone release published as `release-2026-03-12-goose-rerun-branchfix`
 
 ## In Progress
 

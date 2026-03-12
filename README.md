@@ -6,9 +6,9 @@ datasets for the United States.
 The repo is organized around one job:
 
 1. pull source data
-2. import canonical OSM into local PostGIS
-3. derive corridors, exits, places, and reference routes
-4. export a dated public release with lineage
+2. import canonical OSM plus supporting road and POI context into local PostGIS
+3. derive corridors, exits, places, and reference routes from that canonical store
+4. export a dated interstate-focused public release with lineage
 
 ## One Command Local Run
 
@@ -75,7 +75,7 @@ OpenInterstate is the upstream interstate data layer. It does not define:
 
 ## Public Surface
 
-The initial public release contains:
+The current public release contains:
 
 1. corridors
 2. corridor edges
@@ -85,6 +85,14 @@ The initial public release contains:
 6. exit-place links
 7. exit-place scores
 8. reference routes
+
+The internal canonical database is broader than the public release. It keeps
+supporting highway context and POIs needed for derivation, but the exported
+release is narrowed back to Interstate corridors and official signed branch
+routes such as `I-35E`, `I-35W`, `I-69C`, `I-69E`, and `I-69W`.
+
+`exit_aliases` is part of the public surface, but it is currently emitted as an
+empty table until the standalone exit-alias normalization layer is populated.
 
 Project links:
 

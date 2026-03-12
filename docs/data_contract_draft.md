@@ -9,6 +9,9 @@ release.
 2. define a small, legible first release
 3. separate public schema from application-specific runtime exports
 
+Current v1 packaging is CSV-first. Geometry columns are emitted as GeoJSON text
+inside the CSV tables, with GPX used for reference-route exports.
+
 ## Draft Tables
 
 ### corridors
@@ -21,8 +24,8 @@ Draft key fields:
 - `interstate_name`
 - `direction_code`
 - `direction_label`
-- `distance_m`
-- `geometry`
+- `geometry_geojson`
+- `edge_count`
 
 ### corridor_edges
 
@@ -32,8 +35,10 @@ Draft key fields:
 
 - `edge_id`
 - `corridor_id`
-- `sequence_index`
-- `geometry`
+- `interstate_name`
+- `direction_code`
+- `length_m`
+- `geometry_geojson`
 
 ### corridor_exits
 
@@ -43,22 +48,27 @@ Draft key fields:
 
 - `exit_id`
 - `corridor_id`
+- `interstate_name`
+- `direction_code`
+- `sequence_index`
 - `exit_number`
 - `exit_name`
 - `lat`
 - `lon`
-- `geometry`
+- `geometry_geojson`
 
 ### exit_aliases
 
 Maps source exits onto normalized corridor exits.
 
+Current standalone status: this table is exported as a two-column mapping from
+`canonical_exit_id` to `source_exit_id`, but it is currently empty because the
+standalone alias-normalization layer is not yet populated.
+
 Draft key fields:
 
-- `alias_id`
-- `exit_id`
-- `source_name`
-- `source_ref`
+- `canonical_exit_id`
+- `source_exit_id`
 
 ### places
 
@@ -67,12 +77,11 @@ Represents places reachable from exits.
 Draft key fields:
 
 - `place_id`
-- `name`
 - `category`
+- `name`
+- `display_name`
 - `brand`
-- `lat`
-- `lon`
-- `geometry`
+- `geometry_geojson`
 
 ### exit_place_links
 
@@ -80,10 +89,11 @@ Represents link relationships between exits and places.
 
 Draft key fields:
 
-- `link_id`
 - `exit_id`
 - `place_id`
-- `selection_state`
+- `category`
+- `distance_m`
+- `rank`
 
 ### exit_place_scores
 
@@ -91,24 +101,36 @@ Represents reachability and ranking metadata for a link.
 
 Draft key fields:
 
-- `link_id`
-- `drive_time_s`
-- `drive_distance_m`
+- `exit_id`
+- `place_id`
+- `route_distance_m`
+- `route_duration_s`
+- `reachable`
+- `reachability_score`
+- `reachability_confidence`
 - `provider`
-- `score_version`
+- `provider_dataset_version`
+- `updated_at`
 
 ### reference_routes
 
 Represents route artifacts used for exploration and QA.
 
+Current standalone status: only corridors that meet the current route-builder
+thresholds are emitted as reference routes. Short corridors may still appear in
+`corridors.csv` without a matching reference route.
+
 Draft key fields:
 
 - `reference_route_id`
-- `corridor_id`
+- `interstate_name`
+- `direction_code`
+- `direction_label`
 - `display_name`
 - `distance_m`
 - `duration_s`
-- `geometry`
+- `point_count`
+- `waypoints_json`
 
 ## Stable ID Rules
 
@@ -120,13 +142,18 @@ Draft key fields:
 
 Primary:
 
-- GeoParquet
+- CSV with GeoJSON text geometry columns
 
 Secondary:
 
-- FlatGeobuf for GIS downloads
 - GPX for reference routes
+- GeoJSON example extracts
 - JSON manifests for release metadata
+
+Planned follow-on formats:
+
+- Parquet / GeoParquet
+- FlatGeobuf
 
 ## Explicit Non-Goals
 
