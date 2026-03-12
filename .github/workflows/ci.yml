@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Validate required files
-        run: scripts/validate_repo.sh
+        run: tooling/validate_repo.sh
 
       - name: Validate JSON files
         run: |

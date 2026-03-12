@@ -1,0 +1,77 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    shm_size: "2g"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - work_mem=32MB
+      - -c
+      - max_wal_size=32GB
+      - -c
+      - min_wal_size=8GB
+      - -c
+      - checkpoint_timeout=60min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_compression=on
+      - -c
+      - wal_level=minimal
+      - -c
+      - max_wal_senders=0
+      - -c
+      - archive_mode=off
+      - -c
+      - synchronous_commit=off
+      - -c
+      - fsync=off
+      - -c
+      - full_page_writes=off
+      - -c
+      - autovacuum=off
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - random_page_cost=1.1
+    environment:
+      POSTGRES_DB: osm
+      POSTGRES_USER: osm
+      POSTGRES_PASSWORD: osm_dev
+    ports:
+      - "${OI_DB_PORT:-5434}:5432"
+    volumes:
+      - ${OI_DATA_ROOT}/postgres/db:/var/lib/postgresql/data
+      - ./schema/bootstrap.sql:/docker-entrypoint-initdb.d/20_bootstrap.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U osm -d osm"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  runner:
+    build:
+      context: .
+      dockerfile: docker/runner/Dockerfile
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - ${OI_DATA_ROOT}:/data
+      - ${OI_RELEASE_DIR:-./.data/releases}:/releases
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/workspace/target
+
+volumes:
+  cargo-registry:
+    driver: local
+  cargo-git:
+    driver: local
+  cargo-target:
+    driver: local

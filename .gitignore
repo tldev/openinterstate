@@ -3,7 +3,7 @@ node_modules/
 dist/
 .env
 .env.*
-!.env.pipeline.example
+!.env.example
 build/
 .venv/
 __pycache__/

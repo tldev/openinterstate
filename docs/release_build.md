@@ -7,42 +7,54 @@ public release from the raw U.S. OSM PBF.
 
 1. optionally prefilters the raw U.S. PBF into a canonical OpenInterstate import file
 2. imports canonical OSM into local PostGIS with `osm2pgsql`
-3. derives product tables with `pipeline/sql/derive_product.sql`
-4. builds graph, corridors, and reference routes with `openinterstate-import`
+3. derives product tables with `schema/derive.sql`
+4. builds graph, corridors, and reference routes with `openinterstate-derive`
 5. exports a dated public release with manifest, checksums, and source lineage
 6. optionally publishes the release to GitHub
 
 ## Prerequisites
 
-Required on the host:
+Required on the host for local builds:
 
 1. Docker
-2. `osm2pgsql`
-3. `osmium`
-4. `python3`
-5. `gh` for publishing
+
+Optional on the host:
+
+1. `gh` if you want to publish a release to GitHub from your machine
+
+If local disk is constrained, put the managed data workspace on another volume:
+
+```bash
+./bin/openinterstate --data-dir /Volumes/goose-drive/openinterstate-data build
+```
+
+If you want release artifacts in a separate directory, set an explicit release
+root:
+
+```bash
+./bin/openinterstate \
+  --data-dir /Volumes/goose-drive/openinterstate-data \
+  --release-dir /Volumes/goose-drive/openinterstate-releases \
+  build
+```
 
 ## Environment Setup
 
-Copy `.env.pipeline.example` to `.env.pipeline` and set the host paths for:
+The default local workflow works without any env file and stores working data in
+repo-local `.data/`, with release artifacts written to `.data/releases/`.
 
-1. PostGIS data directory
-2. flatnodes cache
-3. raw PBF download directory
-4. filtered canonical PBF directory
-5. build output directory
+If you want to override the defaults, copy `.env.example` to `.env` and update:
 
-The host-accessible DB fields `OSM_DB_*` are used for export. The
-container-network `PRODUCT_DB_URL` is used by the Rust steps run through Docker.
+1. the exposed Postgres host port
+2. the managed data workspace root
+3. the release output root
+4. the default Geofabrik source URL
+5. canonical import safety flags
 
 ## One-Command Build
 
 ```bash
-./openinterstate-pipeline.sh --env-file .env.pipeline run \
-  --pbf-file /abs/path/us-latest.osm.pbf \
-  --source-url https://download.geofabrik.de/north-america/us-latest.osm.pbf \
-  --release-id release-2026-03-11-standalone \
-  --force-prefilter
+./bin/openinterstate build
 ```
 
 ## Split Commands
@@ -50,19 +62,21 @@ container-network `PRODUCT_DB_URL` is used by the Rust steps run through Docker.
 If you want to run the pipeline in stages:
 
 ```bash
-./openinterstate-pipeline.sh --env-file .env.pipeline import-canonical \
+./bin/openinterstate download
+
+./bin/openinterstate import \
   --pbf-file /abs/path/us-latest.osm.pbf \
   --force-prefilter
 
-./openinterstate-pipeline.sh --env-file .env.pipeline derive
+./bin/openinterstate derive
 
-./openinterstate-pipeline.sh --env-file .env.pipeline release \
+./bin/openinterstate release \
   --release-id release-2026-03-11-standalone \
   --source-pbf-file /abs/path/us-latest.osm.pbf \
   --import-pbf-file /abs/path/us-latest.canonical-filtered.osm.pbf \
   --source-url https://download.geofabrik.de/north-america/us-latest.osm.pbf
 
-./openinterstate-pipeline.sh --env-file .env.pipeline publish \
+./bin/openinterstate publish \
   --release-id release-2026-03-11-standalone
 ```
 

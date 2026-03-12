@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib.sh"
+
+ENV_FILE="$DEFAULT_ENV_FILE"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  bin/openinterstate [--env-file /abs/path/.env] [--data-dir /abs/path] [--release-dir /abs/path] <command> [args]
+
+Commands:
+  build            Download or use a source PBF, import it, derive data, and export a release
+  download         Download the latest U.S. PBF into the managed data directory
+  import           Import canonical OSM into local PostGIS
+  derive           Build product tables, graph data, corridors, and reference routes
+  release          Export release artifacts from the local database
+  publish          Publish a built release to GitHub
+  db up            Start local PostGIS
+  db down          Stop local services
+
+One-command local run:
+  ./bin/openinterstate build
+
+External data volume:
+  ./bin/openinterstate --data-dir /Volumes/goose-drive/openinterstate-data build
+
+External data volume with explicit release output:
+  ./bin/openinterstate \
+    --data-dir /Volumes/goose-drive/openinterstate-data \
+    --release-dir /Volumes/goose-drive/openinterstate-releases \
+    build
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "${1:-}" in
+    --env-file)
+      [[ $# -ge 3 ]] || { usage; exit 1; }
+      ENV_FILE="$2"
+      shift 2
+      ;;
+    --data-dir)
+      [[ $# -ge 3 ]] || { usage; exit 1; }
+      export OI_DATA_ROOT="$2"
+      shift 2
+      ;;
+    --release-dir)
+      [[ $# -ge 3 ]] || { usage; exit 1; }
+      export OI_RELEASE_DIR="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+COMMAND="${1:-}"
+[[ -n "$COMMAND" ]] || { usage; exit 1; }
+shift || true
+
+oi_require_cmd docker
+oi_load_env "$ENV_FILE"
+oi_set_defaults
+oi_prepare_dirs
+oi_compose_cmd "$ENV_FILE"
+
+case "$COMMAND" in
+  build)
+    PBF_FILE=""
+    PBF_URL=""
+    SOURCE_URL=""
+    RELEASE_ID="release-$(date +%F)"
+    OUTPUT_ROOT="$OI_RELEASE_DIR"
+    PREFILTER=true
+    FORCE_PREFILTER=false
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --pbf-file)
+          PBF_FILE="$2"
+          shift 2
+          ;;
+        --pbf-url)
+          PBF_URL="$2"
+          shift 2
+          ;;
+        --source-url)
+          SOURCE_URL="$2"
+          shift 2
+          ;;
+        --release-id)
+          RELEASE_ID="$2"
+          shift 2
+          ;;
+        --output-root)
+          OUTPUT_ROOT="$2"
+          shift 2
+          ;;
+        --release-dir)
+          OUTPUT_ROOT="$2"
+          shift 2
+          ;;
+        --skip-prefilter)
+          PREFILTER=false
+          shift 1
+          ;;
+        --force-prefilter)
+          FORCE_PREFILTER=true
+          shift 1
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          oi_die "unknown arg: $1"
+          ;;
+      esac
+    done
+
+    if [[ -n "$PBF_FILE" && -n "$PBF_URL" ]]; then
+      oi_die "choose either --pbf-file or --pbf-url"
+    fi
+
+    if [[ -z "$PBF_FILE" && -z "$PBF_URL" ]]; then
+      PBF_URL="$OI_DEFAULT_US_PBF_URL"
+    fi
+
+    if [[ -n "$PBF_URL" ]]; then
+      PBF_FILE="$(oi_download_pbf "$PBF_URL")" || exit $?
+      if [[ -z "$SOURCE_URL" ]]; then
+        SOURCE_URL="$PBF_URL"
+      fi
+    fi
+
+    oi_db_up
+    oi_wait_for_db
+
+    IMPORT_PBF="$(oi_import_canonical "$PBF_FILE" "$PREFILTER" "$FORCE_PREFILTER")" || exit $?
+    oi_apply_derive
+    oi_export_release "$RELEASE_ID" "$PBF_FILE" "$IMPORT_PBF" "$SOURCE_URL" "$OUTPUT_ROOT"
+
+    oi_log "Build complete"
+    echo "  release: $OUTPUT_ROOT/$RELEASE_ID"
+    echo "  archive: $OUTPUT_ROOT/openinterstate-$RELEASE_ID.tar.gz"
+    ;;
+  download)
+    SOURCE_URL="$OI_DEFAULT_US_PBF_URL"
+    OUTPUT=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --url)
+          SOURCE_URL="$2"
+          shift 2
+          ;;
+        --output)
+          OUTPUT="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          oi_die "unknown arg: $1"
+          ;;
+      esac
+    done
+    oi_download_pbf "$SOURCE_URL" "$OUTPUT"
+    ;;
+  import)
+    PBF_FILE=""
+    PREFILTER=true
+    FORCE_PREFILTER=false
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --pbf-file)
+          PBF_FILE="$2"
+          shift 2
+          ;;
+        --skip-prefilter)
+          PREFILTER=false
+          shift 1
+          ;;
+        --force-prefilter)
+          FORCE_PREFILTER=true
+          shift 1
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          oi_die "unknown arg: $1"
+          ;;
+      esac
+    done
+    [[ -n "$PBF_FILE" ]] || oi_die "--pbf-file is required"
+    oi_db_up
+    oi_wait_for_db
+    oi_import_canonical "$PBF_FILE" "$PREFILTER" "$FORCE_PREFILTER"
+    ;;
+  derive)
+    oi_db_up
+    oi_wait_for_db
+    oi_apply_derive
+    ;;
+  release)
+    RELEASE_ID=""
+    SOURCE_PBF_FILE=""
+    IMPORT_PBF_FILE=""
+    SOURCE_URL=""
+    OUTPUT_ROOT="$OI_RELEASE_DIR"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --release-id)
+          RELEASE_ID="$2"
+          shift 2
+          ;;
+        --source-pbf-file)
+          SOURCE_PBF_FILE="$2"
+          shift 2
+          ;;
+        --import-pbf-file)
+          IMPORT_PBF_FILE="$2"
+          shift 2
+          ;;
+        --source-url)
+          SOURCE_URL="$2"
+          shift 2
+          ;;
+        --output-root)
+          OUTPUT_ROOT="$2"
+          shift 2
+          ;;
+        --release-dir)
+          OUTPUT_ROOT="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          oi_die "unknown arg: $1"
+          ;;
+      esac
+    done
+    [[ -n "$RELEASE_ID" && -n "$SOURCE_PBF_FILE" ]] || oi_die "--release-id and --source-pbf-file are required"
+    oi_db_up
+    oi_wait_for_db
+    oi_export_release "$RELEASE_ID" "$SOURCE_PBF_FILE" "${IMPORT_PBF_FILE:-$SOURCE_PBF_FILE}" "$SOURCE_URL" "$OUTPUT_ROOT"
+    ;;
+  publish)
+    RELEASE_ID=""
+    OUTPUT_ROOT="$OI_RELEASE_DIR"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --release-id)
+          RELEASE_ID="$2"
+          shift 2
+          ;;
+        --output-root)
+          OUTPUT_ROOT="$2"
+          shift 2
+          ;;
+        --release-dir)
+          OUTPUT_ROOT="$2"
+          shift 2
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *)
+          oi_die "unknown arg: $1"
+          ;;
+      esac
+    done
+    [[ -n "$RELEASE_ID" ]] || oi_die "--release-id is required"
+    oi_publish_release "$RELEASE_ID" "$OUTPUT_ROOT"
+    ;;
+  db)
+    case "${1:-}" in
+      up)
+        oi_db_up
+        oi_wait_for_db
+        ;;
+      down)
+        oi_db_down
+        ;;
+      *)
+        usage
+        exit 1
+        ;;
+    esac
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    oi_die "unknown command: $COMMAND"
+    ;;
+esac

@@ -1,6 +1,6 @@
 # Program Status
 
-Date: 2026-03-11
+Date: 2026-03-12
 
 ## Completed
 
@@ -21,6 +21,9 @@ Date: 2026-03-11
 15. source lineage added to `manifest.json` and `source_lineage.json`
 16. standalone public dataset release built and published as `release-2026-03-11-standalone`
 17. public site deployed on `openinterstate.org`
+18. local pipeline reorganized around `bin/`, `schema/`, `crates/`, `docker/`, and `tooling/`
+19. single-command local build verified from a blank external data root on `/Volumes/goose-drive`
+20. release output root made configurable, with default local releases now written under the managed data root
 
 ## In Progress
 
