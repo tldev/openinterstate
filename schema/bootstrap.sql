@@ -2,11 +2,6 @@
 -- This repo does not carry an in-place upgrade path; a fresh clone should
 -- initialize directly into the current standalone schema.
 
-CREATE TABLE IF NOT EXISTS meta (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS exits (
     id TEXT PRIMARY KEY,
     osm_type TEXT NOT NULL,
@@ -36,38 +31,6 @@ CREATE TABLE IF NOT EXISTS pois (
 );
 CREATE INDEX IF NOT EXISTS pois_geom_idx ON pois USING GIST (geom);
 CREATE INDEX IF NOT EXISTS pois_category_idx ON pois (category);
-
-CREATE TABLE IF NOT EXISTS poi_canonical (
-    id TEXT PRIMARY KEY,
-    category TEXT,
-    name TEXT,
-    display_name TEXT,
-    brand TEXT,
-    geom GEOMETRY(Point, 4326) NOT NULL,
-    tags_json JSONB,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS poi_canonical_geom_idx ON poi_canonical USING GIST (geom);
-CREATE INDEX IF NOT EXISTS poi_canonical_category_idx ON poi_canonical (category);
-
-CREATE TABLE IF NOT EXISTS poi_provider_observations (
-    provider TEXT NOT NULL,
-    provider_poi_id TEXT NOT NULL,
-    canonical_poi_id TEXT NOT NULL REFERENCES poi_canonical(id),
-    category TEXT,
-    name TEXT,
-    display_name TEXT,
-    brand TEXT,
-    geom GEOMETRY(Point, 4326) NOT NULL,
-    tags_json JSONB,
-    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (provider, provider_poi_id)
-);
-CREATE INDEX IF NOT EXISTS poi_provider_obs_geom_idx
-    ON poi_provider_observations USING GIST (geom);
-CREATE INDEX IF NOT EXISTS poi_provider_obs_canonical_idx
-    ON poi_provider_observations (canonical_poi_id);
 
 CREATE TABLE IF NOT EXISTS highway_edges (
     id TEXT PRIMARY KEY,

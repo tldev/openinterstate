@@ -6,14 +6,12 @@
 //! Merge pipeline per highway:
 //! 1. Directional split — split mixed-direction components via directed BFS
 //! 2. Absorb tiny post-split fragments (≤10 edges) back into parent
-//! 3. Gap bridging — BFS through OSM ways to connect component terminals
-//! 4. Forced merges — connect bridge components to their targets (no direction check)
-//! 5. Shared-node merge — union-find on components sharing graph nodes (group-aggregate displacement)
-//! 6. Motorway-link bridge merge — components connected via ref'd links (cosine > 0.5)
-//! 7. Proximity merge — terminal nodes within 10km + bearing compatibility (skip bridge comps)
-//! 8. BBox overlap merge — same-direction components with overlapping bounding boxes
-//! 9. Walk exits — collect exits by graph node membership, order by displacement projection
-//! 10. Minor corridor absorption — corridors with <10% edges or ≤5 exits absorbed into primary
+//! 3. Shared-node merge — union-find on components sharing graph nodes
+//! 4. Motorway-link bridge merge — components connected via ref'd links (cosine > 0.5)
+//! 5. Proximity merge — terminal nodes within 10km + bearing compatibility
+//! 6. BBox overlap merge — same-direction components with overlapping bounding boxes
+//! 7. Walk exits — collect exits by graph node membership, order by displacement projection
+//! 8. Minor corridor absorption — corridors with <10% edges or ≤5 exits absorbed into primary
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -46,7 +44,6 @@ type EdgeDbRow = (
     f64,            // start_lon
     f64,            // end_lat
     f64,            // end_lon
-    Option<String>, // polyline_json (lab mode only)
 );
 
 type ExitDbRow = (
@@ -73,8 +70,6 @@ struct EdgeData {
     start_lon: f64,
     end_lat: f64,
     end_lon: f64,
-    /// Full polyline as JSON array of [lon,lat] pairs. Only populated in lab mode.
-    polyline_json: Option<String>,
 }
 
 #[derive(Clone)]
@@ -149,307 +144,6 @@ impl UnionFind {
 }
 
 // ============================================================================
-// Lab mode — fast iteration on targeted highways (no DB writes)
-// ============================================================================
-
-pub async fn build_corridors_lab(
-    pool: &PgPool,
-    highways: &[&str],
-    geojson_out: Option<&str>,
-) -> Result<(), anyhow::Error> {
-    let placeholders: Vec<String> = highways
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("${}", i + 1))
-        .collect();
-    let in_clause = placeholders.join(", ");
-
-    tracing::info!("Loading edges for {} highways...", highways.len());
-    let edge_sql = format!(
-        "SELECT id, highway, component, start_node, end_node, length_m, direction, \
-         ST_Y(ST_StartPoint(geom)) as start_lat, ST_X(ST_StartPoint(geom)) as start_lon, \
-         ST_Y(ST_EndPoint(geom)) as end_lat, ST_X(ST_EndPoint(geom)) as end_lon, \
-         polyline_json \
-         FROM highway_edges WHERE highway IN ({}) \
-         ORDER BY highway, component, id",
-        in_clause
-    );
-    let mut query = sqlx::query_as::<_, EdgeDbRow>(&edge_sql);
-    for hw in highways {
-        query = query.bind(*hw);
-    }
-    let raw_edges: Vec<EdgeData> = query
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|r| EdgeData {
-            id: r.0,
-            highway: r.1,
-            component: r.2,
-            start_node: r.3,
-            end_node: r.4,
-            length_m: r.5,
-            direction: r.6,
-            start_lat: r.7,
-            start_lon: r.8,
-            end_lat: r.9,
-            end_lon: r.10,
-            polyline_json: r.11,
-        })
-        .collect();
-    tracing::info!("Loaded {} edges", raw_edges.len());
-
-    tracing::info!("Loading exit corridor data...");
-    let exit_sql = format!(
-        "SELECT ec.exit_id, ec.highway, ec.graph_component, ec.graph_node, \
-         e.ref, e.name, ST_Y(e.geom) as lat, ST_X(e.geom) as lon \
-         FROM exit_corridors ec JOIN exits e ON e.id = ec.exit_id \
-         WHERE ec.highway IN ({}) \
-         ORDER BY ec.highway, ec.graph_component",
-        in_clause
-    );
-    let mut query = sqlx::query_as::<_, ExitDbRow>(&exit_sql);
-    for hw in highways {
-        query = query.bind(*hw);
-    }
-    let exit_rows: Vec<ExitDbRow> = query.fetch_all(pool).await?;
-    let mut exits_by_highway: BTreeMap<String, Vec<ExitData>> = BTreeMap::new();
-    for r in exit_rows {
-        exits_by_highway
-            .entry(r.1.clone())
-            .or_default()
-            .push(ExitData {
-                exit_id: r.0,
-                graph_node: r.3,
-                ref_val: r.4,
-                name: r.5,
-                lat: r.6,
-                lon: r.7,
-            });
-    }
-    let exits_by_highway: Vec<(String, Vec<ExitData>)> = exits_by_highway.into_iter().collect();
-
-    tracing::info!("Loading motorway_link bridges...");
-    let link_bridges = load_motorway_link_bridges_filtered(pool, &in_clause, highways).await?;
-    tracing::info!(
-        "Found {} relevant terminal bridge pairs",
-        link_bridges.len()
-    );
-
-    tracing::info!("Loading ref'd motorway_link endpoints...");
-    let refd_links = load_refd_link_endpoints_filtered(pool, highways).await?;
-    tracing::info!("Loaded {} ref'd link endpoints", refd_links.len());
-
-    // Group by highway
-    let mut edges_by_highway: BTreeMap<String, Vec<EdgeData>> = BTreeMap::new();
-    for e in raw_edges {
-        edges_by_highway
-            .entry(e.highway.clone())
-            .or_default()
-            .push(e);
-    }
-
-    let mut bridges_by_highway: HashMap<String, Vec<(i32, i32)>> = HashMap::new();
-    for (highway, comp_a, comp_b) in &link_bridges {
-        bridges_by_highway
-            .entry(highway.clone())
-            .or_default()
-            .push((*comp_a, *comp_b));
-    }
-
-    // Process each highway and report
-    tracing::info!("=== LAB RESULTS ===");
-    let mut next_corridor_id: i32 = 1;
-    for (highway, hw_edges) in &mut edges_by_highway {
-        let hw_exits_owned = exits_by_highway
-            .iter()
-            .find(|(h, _)| h == highway)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default();
-
-        // Split mixed-direction components BEFORE gap bridging so that
-        // bridges connect directionally coherent sub-components.
-        let (split, orig_to_split) = presplit_and_absorb(highway, hw_edges);
-        *hw_edges = split;
-
-        // Translate DB bridge pairs from pre-split to post-split comp IDs
-        let mut hw_bridges: Vec<(i32, i32)> = bridges_by_highway
-            .get(highway.as_str())
-            .map(|v| translate_bridge_pairs(v, &orig_to_split))
-            .unwrap_or_default();
-        // Add ref'd link bridge pairs (already use post-split IDs from edge data)
-        let refd_pairs = find_refd_link_bridge_pairs(highway, hw_edges, &refd_links);
-        hw_bridges.extend(refd_pairs);
-
-        // Bridge gaps between components by finding connecting OSM ways
-        let bridge =
-            bridge_component_gaps(pool, highway, hw_edges, &hw_exits_owned, 20_000.0).await?;
-        hw_edges.extend(bridge.edges);
-        let mut all_exits = hw_exits_owned;
-        all_exits.extend(bridge.exits);
-
-        let distinct_comps: HashSet<i32> = hw_edges.iter().map(|e| e.component).collect();
-        let corridors = build_highway_corridors(
-            highway,
-            hw_edges,
-            &all_exits,
-            &hw_bridges,
-            &bridge.forced_merges,
-            &mut next_corridor_id,
-        );
-
-        let total_exits: usize = corridors.iter().map(|c| c.exits.len()).sum();
-        let status = if corridors.len() == 2 {
-            "OK"
-        } else {
-            "PROBLEM"
-        };
-        tracing::info!(
-            "  {} [{}]: {} components → {} corridors, {} exits",
-            highway,
-            status,
-            distinct_comps.len(),
-            corridors.len(),
-            total_exits,
-        );
-        for c in &corridors {
-            let dir = c.canonical_direction.as_deref().unwrap_or("?");
-            tracing::info!(
-                "    corridor {}: {} ({} edges, {} exits)",
-                c.corridor_id,
-                dir,
-                c.member_edge_ids.len(),
-                c.exits.len(),
-            );
-        }
-    }
-
-    // Write GeoJSON visualization if requested
-    if let Some(out_path) = geojson_out {
-        write_lab_geojson(out_path, &edges_by_highway, &exits_by_highway)?;
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// Lab GeoJSON visualization
-// ============================================================================
-
-/// Swap [lat, lon] → [lon, lat] in a polyline JSON string like "[[lat,lon],[lat,lon],...]"
-fn swap_polyline_coords(pj: &str) -> String {
-    // Parse as array of [lat, lon] pairs and re-emit as [lon, lat]
-    let trimmed = pj.trim();
-    if !trimmed.starts_with("[[") {
-        return pj.to_string();
-    }
-    let inner = &trimmed[1..trimmed.len() - 1]; // strip outer []
-    let mut coords = Vec::new();
-    for pair in inner.split("],[") {
-        let pair = pair.trim_start_matches('[').trim_end_matches(']');
-        let mut parts = pair.split(',');
-        if let (Some(lat_s), Some(lon_s)) = (parts.next(), parts.next()) {
-            coords.push(format!("[{},{}]", lon_s.trim(), lat_s.trim()));
-        }
-    }
-    format!("[{}]", coords.join(","))
-}
-
-fn write_lab_geojson(
-    out_path: &str,
-    edges_by_highway: &BTreeMap<String, Vec<EdgeData>>,
-    exits_by_highway: &[(String, Vec<ExitData>)],
-) -> Result<(), anyhow::Error> {
-    let corridor_colors = [
-        "#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628", "#f781bf", "#999999",
-    ];
-
-    let mut features = Vec::new();
-
-    for (highway, hw_edges) in edges_by_highway {
-        // Assign colors by component
-        let comp_list: Vec<i32> = {
-            let mut v: Vec<i32> = hw_edges.iter().map(|e| e.component).collect();
-            v.sort_unstable();
-            v.dedup();
-            v
-        };
-        let comp_color: HashMap<i32, &str> = comp_list
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (c, corridor_colors[i % corridor_colors.len()]))
-            .collect();
-
-        for e in hw_edges {
-            let is_bridge = e.id.starts_with("bridge/");
-            let color = if is_bridge {
-                "#ff00ff"
-            } else {
-                comp_color.get(&e.component).copied().unwrap_or("#888888")
-            };
-            let width = if is_bridge { 5 } else { 3 };
-
-            // Build GeoJSON coordinates [lon, lat].
-            // polyline_json from DB stores [lat, lon] — swap for GeoJSON.
-            // Bridge edges already store [lon, lat] since we built them that way.
-            let coords_json = if let Some(ref pj) = e.polyline_json {
-                if is_bridge {
-                    // Bridge polylines were built as [lon, lat] already
-                    pj.clone()
-                } else {
-                    // DB polylines are [lat, lon] — swap to [lon, lat] for GeoJSON
-                    swap_polyline_coords(pj)
-                }
-            } else {
-                format!(
-                    "[[{},{}],[{},{}]]",
-                    e.start_lon, e.start_lat, e.end_lon, e.end_lat
-                )
-            };
-
-            features.push(format!(
-                "{{\"type\":\"Feature\",\"geometry\":{{\"type\":\"LineString\",\"coordinates\":{}}},\"properties\":{{\"layer\":\"{}\",\"highway\":\"{}\",\"id\":\"{}\",\"component\":{},\"stroke\":\"{}\",\"stroke-width\":{},\"stroke-opacity\":0.9}}}}",
-                coords_json,
-                if is_bridge { "bridge" } else { "edge" },
-                highway, e.id, e.component, color, width,
-            ));
-        }
-
-        // Add exit points
-        let hw_exits = exits_by_highway
-            .iter()
-            .find(|(h, _)| h == highway)
-            .map(|(_, v)| v.as_slice())
-            .unwrap_or(&[]);
-        for exit in hw_exits {
-            let ref_json = exit
-                .ref_val
-                .as_ref()
-                .map(|s| format!("\"{}\"", s))
-                .unwrap_or_else(|| "null".into());
-            let name_json = exit
-                .name
-                .as_ref()
-                .map(|s| format!("\"{}\"", s))
-                .unwrap_or_else(|| "null".into());
-            features.push(format!(
-                "{{\"type\":\"Feature\",\"geometry\":{{\"type\":\"Point\",\"coordinates\":[{},{}]}},\"properties\":{{\"layer\":\"exit\",\"highway\":\"{}\",\"exit_id\":\"{}\",\"ref\":{},\"name\":{},\"marker-color\":\"#0000ff\",\"marker-size\":\"small\"}}}}",
-                exit.lon, exit.lat, highway, exit.exit_id, ref_json, name_json,
-            ));
-        }
-    }
-
-    let geojson = format!(
-        "{{\"type\":\"FeatureCollection\",\"features\":[{}]}}",
-        features.join(",")
-    );
-
-    std::fs::write(out_path, &geojson)?;
-    tracing::info!("Wrote GeoJSON visualization to {}", out_path);
-    Ok(())
-}
-
-// ============================================================================
 // Main entry point
 // ============================================================================
 
@@ -512,7 +206,6 @@ pub async fn build_corridors(pool: &PgPool) -> Result<BuildCorridorsStats, anyho
             hw_edges,
             hw_exits,
             &hw_bridges,
-            &[],
             &mut next_corridor_id,
         );
         if !corridors.is_empty() {
@@ -544,8 +237,7 @@ async fn load_edges(pool: &PgPool) -> Result<Vec<EdgeData>, anyhow::Error> {
     let rows: Vec<EdgeDbRow> = sqlx::query_as(
         "SELECT id, highway, component, start_node, end_node, length_m, direction, \
          ST_Y(ST_StartPoint(geom)) as start_lat, ST_X(ST_StartPoint(geom)) as start_lon, \
-         ST_Y(ST_EndPoint(geom)) as end_lat, ST_X(ST_EndPoint(geom)) as end_lon, \
-         NULL::text as polyline_json \
+         ST_Y(ST_EndPoint(geom)) as end_lat, ST_X(ST_EndPoint(geom)) as end_lon \
          FROM highway_edges \
          ORDER BY highway, component, id",
     )
@@ -566,7 +258,6 @@ async fn load_edges(pool: &PgPool) -> Result<Vec<EdgeData>, anyhow::Error> {
             start_lon: r.8,
             end_lat: r.9,
             end_lon: r.10,
-            polyline_json: r.11,
         })
         .collect())
 }
@@ -658,66 +349,6 @@ async fn load_motorway_link_bridges(
     Ok(rows)
 }
 
-/// Filtered version for lab mode — restricts terminal_nodes CTE to target highways.
-async fn load_motorway_link_bridges_filtered(
-    pool: &PgPool,
-    in_clause: &str,
-    highways: &[&str],
-) -> Result<Vec<(String, i32, i32)>, anyhow::Error> {
-    let sql = format!(
-        "WITH terminal_nodes AS ( \
-           SELECT he.highway, he.component, \
-                  he.start_node AS node, ST_StartPoint(he.geom) AS pt \
-           FROM highway_edges he \
-           WHERE he.highway IN ({in_clause}) \
-             AND NOT EXISTS ( \
-             SELECT 1 FROM highway_edges he2 \
-             WHERE he2.highway = he.highway AND he2.component = he.component \
-               AND he2.end_node = he.start_node \
-           ) \
-           UNION ALL \
-           SELECT he.highway, he.component, \
-                  he.end_node AS node, ST_EndPoint(he.geom) AS pt \
-           FROM highway_edges he \
-           WHERE he.highway IN ({in_clause}) \
-             AND NOT EXISTS ( \
-             SELECT 1 FROM highway_edges he2 \
-             WHERE he2.highway = he.highway AND he2.component = he.component \
-               AND he2.start_node = he.end_node \
-           ) \
-         ), \
-         terminals_with_link AS ( \
-           SELECT DISTINCT t.highway, t.component, t.node, t.pt \
-           FROM terminal_nodes t \
-           WHERE EXISTS ( \
-             SELECT 1 FROM osm2pgsql_v2_highways ml \
-             WHERE ml.tags->>'highway' = 'motorway_link' \
-               AND ml.ref IS NOT NULL \
-               AND ml.ref LIKE '%' || REPLACE(t.highway, '-', ' ') || '%' \
-               AND ST_DWithin(ml.geom::geography, t.pt::geography, 100) \
-           ) \
-         ) \
-         SELECT DISTINCT t1.highway, \
-                LEAST(t1.component, t2.component) AS comp_a, \
-                GREATEST(t1.component, t2.component) AS comp_b \
-         FROM terminals_with_link t1 \
-         JOIN terminals_with_link t2 \
-           ON t1.highway = t2.highway \
-          AND t1.component < t2.component \
-          AND ST_DWithin(t1.pt::geography, t2.pt::geography, 2000)",
-    );
-    // Bind highways twice (once per UNION ALL branch in terminal_nodes)
-    let mut query = sqlx::query_as::<_, (String, i32, i32)>(&sql);
-    for hw in highways {
-        query = query.bind(*hw);
-    }
-    for hw in highways {
-        query = query.bind(*hw);
-    }
-    let rows = query.fetch_all(pool).await?;
-    Ok(rows)
-}
-
 /// Load ref'd motorway_link way endpoints from osm2pgsql_v2_highways.
 /// Returns (normalized_highway_ref, first_node_id, last_node_id) for each link.
 ///
@@ -745,51 +376,9 @@ async fn load_refd_link_endpoints(pool: &PgPool) -> Result<Vec<(String, i64, i64
         let last = node_ids[node_ids.len() - 1];
         // Each link may carry multiple refs (semicolon-separated)
         for part in ref_str.split(';') {
-            if let Some(normalized) = openinterstate_core::highway_ref::normalize_highway_ref(part.trim()) {
-                result.push((normalized, first, last));
-            }
-        }
-    }
-    Ok(result)
-}
-
-/// Filtered version for lab mode.
-async fn load_refd_link_endpoints_filtered(
-    pool: &PgPool,
-    highways: &[&str],
-) -> Result<Vec<(String, i64, i64)>, anyhow::Error> {
-    // Build LIKE conditions: ref LIKE '%I 10%' OR ref LIKE '%I 40%' ...
-    // We match on the raw ref format (spaces, not dashes)
-    let like_clauses: Vec<String> = highways
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("ref LIKE '%' || ${} || '%'", i + 1))
-        .collect();
-    let sql = format!(
-        "SELECT ref, node_ids \
-         FROM osm2pgsql_v2_highways \
-         WHERE highway = 'motorway_link' \
-           AND ref IS NOT NULL \
-           AND array_length(node_ids, 1) >= 2 \
-           AND ({})",
-        like_clauses.join(" OR ")
-    );
-    let mut query = sqlx::query_as::<_, (Option<String>, Vec<i64>)>(&sql);
-    // Bind raw highway refs in OSM format (e.g. "I 10" not "I-10")
-    for hw in highways {
-        query = query.bind(hw.replace('-', " "));
-    }
-    let rows = query.fetch_all(pool).await?;
-
-    let mut result = Vec::new();
-    for (ref_raw, node_ids) in rows {
-        let Some(ref_str) = ref_raw.as_deref() else {
-            continue;
-        };
-        let first = node_ids[0];
-        let last = node_ids[node_ids.len() - 1];
-        for part in ref_str.split(';') {
-            if let Some(normalized) = openinterstate_core::highway_ref::normalize_highway_ref(part.trim()) {
+            if let Some(normalized) =
+                openinterstate_core::highway_ref::normalize_highway_ref(part.trim())
+            {
                 result.push((normalized, first, last));
             }
         }
@@ -890,19 +479,6 @@ fn split_mixed_direction_components(highway: &str, edges: &[EdgeData]) -> Vec<Ed
     let mut total_splits = 0usize;
 
     for (&comp, edge_indices) in &edges_by_comp {
-        // Skip components containing synthetic bridge edges — these connect
-        // components through interchanges with mixed directionality and must
-        // not be split.
-        let has_bridge = edge_indices
-            .iter()
-            .any(|&idx| edges[idx].id.starts_with("bridge/"));
-        if has_bridge {
-            for &idx in edge_indices {
-                result.push(edges[idx].clone());
-            }
-            continue;
-        }
-
         // Count edges by primary axis direction
         let mut forward = 0usize; // north or east
         let mut reverse = 0usize; // south or west
@@ -1032,554 +608,11 @@ fn split_mixed_direction_components(highway: &str, edges: &[EdgeData]) -> Vec<Ed
     result
 }
 
-// ============================================================================
-// Pre-split: split mixed-direction components before gap bridging
-// ============================================================================
-
-/// Split mixed-direction components and absorb tiny post-split fragments.
-/// Returns (split_edges, orig_to_split mapping).
-///
-/// Must be called BEFORE gap bridging so that bridges connect directionally
-/// coherent sub-components (not mixed EB/WB original components).
-fn presplit_and_absorb(
-    highway: &str,
-    edges: &[EdgeData],
-) -> (Vec<EdgeData>, HashMap<i32, HashSet<i32>>) {
-    let orig_comp_by_edge_id: HashMap<&str, i32> =
-        edges.iter().map(|e| (e.id.as_str(), e.component)).collect();
-    let mut split_edges = split_mixed_direction_components(highway, edges);
-
-    let mut orig_to_split: HashMap<i32, HashSet<i32>> = HashMap::new();
-    for e in &split_edges {
-        let orig = orig_comp_by_edge_id
-            .get(e.id.as_str())
-            .copied()
-            .unwrap_or(e.component);
-        orig_to_split.entry(orig).or_default().insert(e.component);
-    }
-
-    // Absorb tiny post-split fragments (≤10 edges)
-    let mut comp_edge_count: HashMap<i32, usize> = HashMap::new();
-    for e in &split_edges {
-        *comp_edge_count.entry(e.component).or_default() += 1;
-    }
-    let mut remap: HashMap<i32, i32> = HashMap::new();
-    for (_orig, subs) in &orig_to_split {
-        if subs.len() <= 1 {
-            continue;
-        }
-        let largest = subs
-            .iter()
-            .max_by_key(|&&c| comp_edge_count.get(&c).copied().unwrap_or(0))
-            .copied()
-            .unwrap();
-        for &sub in subs {
-            if sub != largest {
-                let count = comp_edge_count.get(&sub).copied().unwrap_or(0);
-                if count <= 10 {
-                    remap.insert(sub, largest);
-                }
-            }
-        }
-    }
-    if !remap.is_empty() {
-        tracing::info!(
-            "  {}: absorbed {} tiny post-split fragments",
-            highway,
-            remap.len()
-        );
-        for e in &mut split_edges {
-            if let Some(&target) = remap.get(&e.component) {
-                e.component = target;
-            }
-        }
-        // Update orig_to_split to reflect absorption
-        for subs in orig_to_split.values_mut() {
-            let remapped: HashSet<i32> = subs
-                .iter()
-                .map(|&c| remap.get(&c).copied().unwrap_or(c))
-                .collect();
-            *subs = remapped;
-        }
-    }
-
-    (split_edges, orig_to_split)
-}
-
-/// Translate bridge pairs from pre-split component IDs to post-split IDs.
-fn translate_bridge_pairs(
-    pairs: &[(i32, i32)],
-    orig_to_split: &HashMap<i32, HashSet<i32>>,
-) -> Vec<(i32, i32)> {
-    let mut result = Vec::new();
-    for &(a, b) in pairs {
-        let subs_a: Vec<i32> = orig_to_split
-            .get(&a)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_else(|| vec![a]);
-        let subs_b: Vec<i32> = orig_to_split
-            .get(&b)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_else(|| vec![b]);
-        for &sa in &subs_a {
-            for &sb in &subs_b {
-                if sa != sb {
-                    result.push((sa.min(sb), sa.max(sb)));
-                }
-            }
-        }
-    }
-    result.sort_unstable();
-    result.dedup();
-    result
-}
-
-// ============================================================================
-// Gap bridging — find OSM ways connecting component terminals
-// ============================================================================
-
-/// Raw OSM way data for gap-bridging BFS
-struct RawWay {
-    _way_id: i64,
-    node_ids: Vec<i64>,
-    is_oneway: bool,
-}
-
-/// Result of bridging a gap between two component terminals
-struct GapBridgeResult {
-    edges: Vec<EdgeData>,
-    exits: Vec<ExitData>,
-    /// Component pairs that should be force-merged (BFS validated connectivity)
-    forced_merges: Vec<(i32, i32)>,
-}
-
-/// Load all motorway/motorway_link ways in a bounding box from osm2pgsql_v2_highways.
-async fn load_ways_in_bbox(
-    pool: &PgPool,
-    min_lat: f64,
-    max_lat: f64,
-    min_lon: f64,
-    max_lon: f64,
-) -> Result<Vec<RawWay>, anyhow::Error> {
-    let rows: Vec<(i64, String, Option<String>, Vec<i64>)> = sqlx::query_as(
-        "SELECT way_id, highway, oneway, node_ids \
-         FROM osm2pgsql_v2_highways \
-         WHERE highway IN ('motorway', 'motorway_link', 'trunk', 'trunk_link') \
-           AND node_ids IS NOT NULL AND array_length(node_ids, 1) >= 2 \
-           AND ST_Intersects(geom, ST_MakeEnvelope($1, $2, $3, $4, 4326))",
-    )
-    .bind(min_lon)
-    .bind(min_lat)
-    .bind(max_lon)
-    .bind(max_lat)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(way_id, highway, oneway, node_ids)| {
-            let ow = oneway.as_deref().unwrap_or("");
-            let is_oneway = match ow {
-                "no" => false,
-                "-1" | "yes" | "1" => true,
-                _ => highway == "motorway" || highway == "motorway_link",
-            };
-            RawWay {
-                _way_id: way_id,
-                node_ids,
-                is_oneway,
-            }
-        })
-        .collect())
-}
-
-/// Load exit nodes at specific OSM node IDs from osm2pgsql_v2_exits_nodes.
-async fn load_exits_at_nodes(
-    pool: &PgPool,
-    node_ids: &[i64],
-) -> Result<Vec<ExitData>, anyhow::Error> {
-    if node_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let rows: Vec<(i64, Option<String>, Option<String>, f64, f64)> = sqlx::query_as(
-        "SELECT node_id, ref, name, ST_Y(geom), ST_X(geom) \
-         FROM osm2pgsql_v2_exits_nodes \
-         WHERE node_id = ANY($1)",
-    )
-    .bind(node_ids)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(node_id, ref_val, name, lat, lon)| ExitData {
-            exit_id: format!("node/{}", node_id),
-            graph_node: node_id,
-            ref_val,
-            name,
-            lat,
-            lon,
-        })
-        .collect())
-}
-
-/// Load node coordinates from osm2pgsql_v2_highways for nodes that appear in ways.
-async fn load_node_coords_from_ways(
-    pool: &PgPool,
-    min_lat: f64,
-    max_lat: f64,
-    min_lon: f64,
-    max_lon: f64,
-) -> Result<HashMap<i64, (f64, f64)>, anyhow::Error> {
-    // Get node coordinates by extracting points from way geometries
-    let rows: Vec<(i64, f64, f64)> = sqlx::query_as(
-        "WITH way_nodes AS ( \
-             SELECT unnest(node_ids) AS node_id, \
-                    generate_subscripts(node_ids, 1) AS idx, \
-                    geom, node_ids \
-             FROM osm2pgsql_v2_highways \
-             WHERE highway IN ('motorway', 'motorway_link', 'trunk', 'trunk_link') \
-               AND node_ids IS NOT NULL \
-               AND ST_Intersects(geom, ST_MakeEnvelope($1, $2, $3, $4, 4326)) \
-         ) \
-         SELECT DISTINCT ON (node_id) node_id, \
-                ST_Y(ST_PointN(geom, idx)) AS lat, \
-                ST_X(ST_PointN(geom, idx)) AS lon \
-         FROM way_nodes",
-    )
-    .bind(min_lon)
-    .bind(min_lat)
-    .bind(max_lon)
-    .bind(max_lat)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|(n, lat, lon)| (n, (lat, lon)))
-        .collect())
-}
-
-/// BFS through raw OSM ways to find a path from `start` to `end`.
-/// Returns the sequence of node IDs along the shortest path, or None if no path exists.
-/// When `undirected` is true, treats all edges as bidirectional (useful for
-/// detecting topological connectivity through interchanges where the directed
-/// path may cross carriageways).
-fn bfs_through_ways(ways: &[RawWay], start: i64, end: i64, undirected: bool) -> Option<Vec<i64>> {
-    // Build adjacency: node → list of (neighbor_node, way_id)
-    let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
-    for way in ways {
-        for window in way.node_ids.windows(2) {
-            let (a, b) = (window[0], window[1]);
-            adj.entry(a).or_default().push(b);
-            if undirected || !way.is_oneway {
-                adj.entry(b).or_default().push(a);
-            }
-        }
-    }
-
-    // BFS
-    let mut visited: HashSet<i64> = HashSet::new();
-    let mut parent: HashMap<i64, i64> = HashMap::new();
-    let mut queue = std::collections::VecDeque::new();
-    visited.insert(start);
-    queue.push_back(start);
-
-    while let Some(node) = queue.pop_front() {
-        if node == end {
-            // Reconstruct path
-            let mut path = vec![end];
-            let mut cur = end;
-            while cur != start {
-                cur = parent[&cur];
-                path.push(cur);
-            }
-            path.reverse();
-            return Some(path);
-        }
-        if let Some(neighbors) = adj.get(&node) {
-            for &next in neighbors {
-                if visited.insert(next) {
-                    parent.insert(next, node);
-                    queue.push_back(next);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Bridge gaps between same-direction component terminals by finding connecting
-/// OSM ways and creating synthetic edges + exits along the path.
-async fn bridge_component_gaps(
-    pool: &PgPool,
-    highway: &str,
-    edges: &[EdgeData],
-    existing_exits: &[ExitData],
-    max_gap_m: f64,
-) -> Result<GapBridgeResult, anyhow::Error> {
-    let mut result = GapBridgeResult {
-        edges: Vec::new(),
-        exits: Vec::new(),
-        forced_merges: Vec::new(),
-    };
-
-    // Find terminal nodes per component (same logic as proximity merge)
-    let mut edges_by_comp: HashMap<i32, Vec<&EdgeData>> = HashMap::new();
-    for e in edges {
-        edges_by_comp.entry(e.component).or_default().push(e);
-    }
-
-    struct CompTerminals {
-        displacement: (f64, f64),
-        edge_count: usize,
-        sources: Vec<(i64, f64, f64)>, // (node_id, lat, lon)
-        sinks: Vec<(i64, f64, f64)>,
-    }
-
-    let mut comp_terminals: HashMap<i32, CompTerminals> = HashMap::new();
-    // Collect node coordinates from edges
-    let mut node_coords: HashMap<i64, (f64, f64)> = HashMap::new();
-    for e in edges {
-        node_coords.insert(e.start_node, (e.start_lat, e.start_lon));
-        node_coords.insert(e.end_node, (e.end_lat, e.end_lon));
-    }
-
-    for (&comp, comp_edges) in &edges_by_comp {
-        let mut in_deg: HashMap<i64, usize> = HashMap::new();
-        let mut out_deg: HashMap<i64, usize> = HashMap::new();
-        let mut delta_lat = 0.0_f64;
-        let mut delta_lon = 0.0_f64;
-        for e in comp_edges {
-            *out_deg.entry(e.start_node).or_default() += 1;
-            *in_deg.entry(e.end_node).or_default() += 1;
-            delta_lat += e.end_lat - e.start_lat;
-            delta_lon += e.end_lon - e.start_lon;
-        }
-
-        let mut sources = Vec::new();
-        let mut sinks = Vec::new();
-        let all_nodes: HashSet<i64> = comp_edges
-            .iter()
-            .flat_map(|e| [e.start_node, e.end_node])
-            .collect();
-        for &node in &all_nodes {
-            let ind = in_deg.get(&node).copied().unwrap_or(0);
-            let outd = out_deg.get(&node).copied().unwrap_or(0);
-            if let Some(&(lat, lon)) = node_coords.get(&node) {
-                if ind == 0 {
-                    sources.push((node, lat, lon));
-                }
-                if outd == 0 {
-                    sinks.push((node, lat, lon));
-                }
-            }
-        }
-
-        comp_terminals.insert(
-            comp,
-            CompTerminals {
-                displacement: (delta_lat, delta_lon),
-                edge_count: comp_edges.len(),
-                sources,
-                sinks,
-            },
-        );
-    }
-
-    // Find gap pairs: sink of comp_a → source of comp_b (same direction, close)
-    let comps: Vec<i32> = comp_terminals.keys().copied().collect();
-    // (sink_node, source_node, dist, sink_component, source_component)
-    let mut gap_pairs: Vec<(i64, i64, f64, i32, i32)> = Vec::new();
-
-    for &ca in &comps {
-        for &cb in &comps {
-            if ca == cb {
-                continue;
-            }
-            let ta = &comp_terminals[&ca];
-            let tb = &comp_terminals[&cb];
-            // Filter interchange fragments: small displacement AND few edges.
-            // Components with 20+ edges are real highway segments (possibly from
-            // a directional split) even if their displacement magnitude is small.
-            let mag_a = (ta.displacement.0.powi(2) + ta.displacement.1.powi(2)).sqrt();
-            let mag_b = (tb.displacement.0.powi(2) + tb.displacement.1.powi(2)).sqrt();
-            if (mag_a < 0.1 && ta.edge_count < 20) || (mag_b < 0.1 && tb.edge_count < 20) {
-                continue;
-            }
-            // Direction check: same direction (dot > 0)
-            let dot = ta.displacement.0 * tb.displacement.0 + ta.displacement.1 * tb.displacement.1;
-            if dot <= 0.0 {
-                continue;
-            }
-            // Find closest sink(a) → source(b) pair
-            for &(sink_node, slat, slon) in &ta.sinks {
-                for &(src_node, rlat, rlon) in &tb.sources {
-                    let dist = haversine_distance(slat, slon, rlat, rlon);
-                    if dist > 0.0 && dist <= max_gap_m {
-                        gap_pairs.push((sink_node, src_node, dist, ca, cb));
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort by distance so we bridge smallest gaps first
-    gap_pairs.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-    tracing::info!(
-        "  {}: found {} candidate gap pairs (max_gap={}km)",
-        highway,
-        gap_pairs.len(),
-        max_gap_m / 1000.0,
-    );
-    for (i, (sink, src, dist, sink_comp, src_comp)) in gap_pairs.iter().enumerate() {
-        let ta = &comp_terminals[sink_comp];
-        let tb = &comp_terminals[src_comp];
-        let dot = ta.displacement.0 * tb.displacement.0 + ta.displacement.1 * tb.displacement.1;
-        let mag_a = (ta.displacement.0.powi(2) + ta.displacement.1.powi(2)).sqrt();
-        let mag_b = (tb.displacement.0.powi(2) + tb.displacement.1.powi(2)).sqrt();
-        let cosine = if mag_a > 0.0 && mag_b > 0.0 {
-            dot / (mag_a * mag_b)
-        } else {
-            0.0
-        };
-        tracing::info!(
-            "  {}: gap pair {}: comp {} → comp {}, sink {} → src {}, dist {:.1}km, disp_a=({:.4},{:.4}) mag={:.4}, disp_b=({:.4},{:.4}) mag={:.4}, cos={:.3}",
-            highway, i, sink_comp, src_comp, sink, src, dist / 1000.0,
-            ta.displacement.0, ta.displacement.1, mag_a,
-            tb.displacement.0, tb.displacement.1, mag_b,
-            cosine,
-        );
-    }
-    // Deduplicate by source node (each source should only be bridged once)
-    let mut bridged_sources: HashSet<i64> = HashSet::new();
-    let mut bridged_sinks: HashSet<i64> = HashSet::new();
-
-    let existing_exit_nodes: HashSet<i64> = existing_exits.iter().map(|e| e.graph_node).collect();
-    let mut bridge_component_id = -1000_i32;
-
-    for (sink_node, src_node, dist, sink_comp, src_comp_known) in &gap_pairs {
-        if bridged_sources.contains(src_node) || bridged_sinks.contains(sink_node) {
-            continue;
-        }
-        let (slat, slon) = node_coords[sink_node];
-        let (rlat, rlon) = node_coords[src_node];
-
-        // Expand bbox by 20% for the way search
-        let pad = 0.02; // ~2km padding in degrees
-        let min_lat = slat.min(rlat) - pad;
-        let max_lat = slat.max(rlat) + pad;
-        let min_lon = slon.min(rlon) - pad;
-        let max_lon = slon.max(rlon) + pad;
-
-        // Load OSM ways in the gap area
-        let ways = load_ways_in_bbox(pool, min_lat, max_lat, min_lon, max_lon).await?;
-        if ways.is_empty() {
-            continue;
-        }
-
-        // BFS to find connecting path. Try directed first; fall back to
-        // undirected to handle interchanges where the directed path crosses
-        // carriageways (e.g. I-96 via I-275 concurrent section).
-        let path = bfs_through_ways(&ways, *sink_node, *src_node, false)
-            .or_else(|| bfs_through_ways(&ways, *sink_node, *src_node, true));
-        if let Some(path) = path {
-            tracing::info!(
-                "  {}: bridged gap {:.1}km ({} → {}, {} nodes in path)",
-                highway,
-                dist / 1000.0,
-                sink_node,
-                src_node,
-                path.len(),
-            );
-
-            // Load coordinates for path nodes
-            let way_node_coords =
-                load_node_coords_from_ways(pool, min_lat, max_lat, min_lon, max_lon).await?;
-
-            // Create synthetic edges along the path (one edge per consecutive pair)
-            // We only need edges between "important" nodes (exits or the terminals)
-            // but for simplicity, create edges between path nodes that have coords
-            let mut prev_node = path[0];
-            let mut prev_coord = way_node_coords
-                .get(&prev_node)
-                .or(node_coords.get(&prev_node))
-                .copied();
-
-            for &node in &path[1..] {
-                let coord = way_node_coords
-                    .get(&node)
-                    .or(node_coords.get(&node))
-                    .copied();
-                if let (Some((plat, plon)), Some((nlat, nlon))) = (prev_coord, coord) {
-                    let len = haversine_distance(plat, plon, nlat, nlon) as i32;
-                    let polyline = format!("[[{},{}],[{},{}]]", plon, plat, nlon, nlat);
-                    result.edges.push(EdgeData {
-                        id: format!("bridge/{}/{}/{}", highway, prev_node, node),
-                        highway: highway.to_string(),
-                        component: bridge_component_id,
-                        start_node: prev_node,
-                        end_node: node,
-                        length_m: len,
-                        direction: None,
-                        start_lat: plat,
-                        start_lon: plon,
-                        end_lat: nlat,
-                        end_lon: nlon,
-                        polyline_json: Some(polyline),
-                    });
-                }
-                prev_node = node;
-                prev_coord = coord;
-            }
-
-            // Load exits along the path
-            let path_nodes: Vec<i64> = path
-                .iter()
-                .filter(|n| !existing_exit_nodes.contains(n))
-                .copied()
-                .collect();
-            let gap_exits = load_exits_at_nodes(pool, &path_nodes).await?;
-            tracing::info!(
-                "  {}: found {} exits in bridged gap",
-                highway,
-                gap_exits.len(),
-            );
-            result.exits.extend(gap_exits);
-
-            // Record forced merges using the KNOWN source component from the
-            // gap pair (not a node_to_comp lookup, which is unreliable at
-            // interchange shared nodes and can return the wrong carriageway).
-            result.forced_merges.push((*sink_comp, bridge_component_id));
-            result
-                .forced_merges
-                .push((*src_comp_known, bridge_component_id));
-            result.forced_merges.push((*sink_comp, *src_comp_known));
-
-            bridge_component_id -= 1;
-            bridged_sources.insert(*src_node);
-            bridged_sinks.insert(*sink_node);
-        } else {
-            tracing::debug!(
-                "  {}: BFS found no path for gap {} → {} ({:.1}km, {} ways in bbox)",
-                highway,
-                sink_node,
-                src_node,
-                dist / 1000.0,
-                ways.len(),
-            );
-        }
-    }
-
-    Ok(result)
-}
-
 fn build_highway_corridors(
     highway: &str,
     edges: &[EdgeData],
     exits: &[ExitData],
     link_bridges: &[(i32, i32)],
-    forced_merges: &[(i32, i32)],
     next_id: &mut i32,
 ) -> Vec<CorridorResult> {
     if edges.is_empty() {
@@ -1717,31 +750,9 @@ fn build_highway_corridors(
         );
     }
 
-    // 2. Forced merges FIRST — connect synthetic bridge components to their
-    //    real target components before any direction-based merge steps.
-    //    This ensures bridge components inherit their group's displacement
-    //    for direction checks in subsequent merge steps.
     let mut uf = UnionFind::new(n);
-    let mut forced_merge_count = 0usize;
-    for &(ca, cb) in forced_merges {
-        if let (Some(&idx_a), Some(&idx_b)) = (comp_to_idx.get(&ca), comp_to_idx.get(&cb)) {
-            if uf.union(idx_a, idx_b) {
-                tracing::debug!("  {}: forced merge comp {} + comp {}", highway, ca, cb);
-                forced_merge_count += 1;
-            }
-        }
-    }
-    if forced_merge_count > 0 {
-        tracing::info!(
-            "  {}: {} forced merges from gap bridging",
-            highway,
-            forced_merge_count
-        );
-    }
 
     // Helper: compute aggregate displacement for a union-find group.
-    // After forced merges, bridge components inherit the direction of
-    // their real target components (which dominate the aggregate).
     let group_displacement = |uf: &mut UnionFind, comp_idx: usize| -> (f64, f64) {
         let root = uf.find(comp_idx);
         let mut dlat = 0.0_f64;
@@ -1756,10 +767,9 @@ fn build_highway_corridors(
         (dlat, dlon)
     };
 
-    // 2b. Union-find: merge components sharing nodes (only if same travel direction).
-    //     Uses group-aggregate displacement so bridge components (which have
-    //     unreliable displacement from BFS paths) use their forced-merge group's
-    //     displacement for direction checking.
+    // 2. Union-find: merge components sharing nodes (only if same travel direction).
+    //    Uses group-aggregate displacement so direction checks stay stable as
+    //    groups accrete multiple fragments.
     let mut node_to_comps: HashMap<i64, Vec<i32>> = HashMap::new();
     for e in edges {
         node_to_comps
@@ -1808,10 +818,10 @@ fn build_highway_corridors(
         tracing::debug!("  {}: {} shared-node merges total", highway, shared_merges);
     }
 
-    // 2c. Motorway-link bridge merge: components connected through motorway_link ways
-    //     (only if same travel direction).
-    //     Bridge pairs use original (pre-split) component IDs, so we translate
-    //     them to post-split sub-component IDs via orig_to_split.
+    // 3. Motorway-link bridge merge: components connected through motorway_link
+    //    ways (only if same travel direction). Bridge pairs use original
+    //    (pre-split) component IDs, so we translate them to post-split
+    //    sub-component IDs via orig_to_split.
     let mut bridge_merges = 0usize;
     for &(orig_a, orig_b) in link_bridges {
         let subs_a = orig_to_split.get(&orig_a);
@@ -1867,7 +877,7 @@ fn build_highway_corridors(
         );
     }
 
-    // 3. Proximity merge: find terminals, merge close ones with compatible bearing.
+    // 4. Proximity merge: find terminals, merge close ones with compatible bearing.
     //    10km threshold covers interchange areas, toll plazas, and short gaps
     //    where adjacent carriageway segments don't share graph nodes.
     //    Bearing check (60°) is applied for terminals >1km apart; for very
@@ -1886,7 +896,7 @@ fn build_highway_corridors(
         tracing::debug!("  {}: {} proximity merges", highway, proximity_merges);
     }
 
-    // 3b. Geographic overlap merge: merge same-direction components whose
+    // 4b. Geographic overlap merge: merge same-direction components whose
     //     bounding boxes overlap along the highway axis. Two components on the
     //     same highway in the same direction that overlap geographically are the
     //     same carriageway — they just lack shared graph nodes.
@@ -1965,7 +975,7 @@ fn build_highway_corridors(
         tracing::debug!("  {}: {} bbox-overlap merges", highway, overlap_merges);
     }
 
-    // 4. Group by merged corridor
+    // 5. Group by merged corridor
     let mut corridor_groups: BTreeMap<usize, Vec<i32>> = BTreeMap::new();
     for (i, &comp) in component_set.iter().enumerate() {
         let root = uf.find(i);
@@ -1982,7 +992,7 @@ fn build_highway_corridors(
         exit_by_node.entry(exit.graph_node).or_default().push(exit);
     }
 
-    // 5. Build each corridor
+    // 6. Build each corridor
     let mut results = Vec::new();
     for group in sorted_groups {
         let group_edges: Vec<&EdgeData> = group
@@ -2041,7 +1051,7 @@ fn build_highway_corridors(
         });
     }
 
-    // 6. Absorb minor corridors into same-direction primary corridors.
+    // 7. Absorb minor corridors into same-direction primary corridors.
     //    A corridor is "minor" if it has 0 exits OR has <5% of the exits
     //    of the largest same-direction corridor. These are interchange stubs,
     //    short carriageway fragments from the directional split, etc.
@@ -2068,7 +1078,7 @@ fn build_highway_corridors(
                 .unwrap_or(0);
             // A corridor is minor if it has <10% of the edges of the largest
             // same-direction corridor, OR if it has very few exits relative
-            // to its edges (bridge-heavy fragment from gap bridging).
+            // to its edges.
             let is_edge_minor = c.member_edge_ids.len() * 10 < primary_edges;
             let is_exit_minor = c.exits.len() <= 5 && primary_edges > c.member_edge_ids.len();
             let is_minor = is_edge_minor || is_exit_minor;
@@ -2221,13 +1231,6 @@ fn merge_components_by_proximity(
         for j in (i + 1)..component_set.len() {
             let ci = component_set[i];
             let cj = component_set[j];
-
-            // Skip synthetic bridge components — they're already connected
-            // via forced merges and their weak displacement can cause
-            // cross-direction proximity merges (e.g. I-64 regression).
-            if ci <= -1000 || cj <= -1000 {
-                continue;
-            }
 
             let idx_i = comp_to_idx[&ci];
             let idx_j = comp_to_idx[&cj];

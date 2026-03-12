@@ -1,7 +1,6 @@
 services:
   db:
     image: postgis/postgis:16-3.4
-    shm_size: "2g"
     command:
       - postgres
       - -c
@@ -40,6 +39,7 @@ services:
       - effective_io_concurrency=200
       - -c
       - random_page_cost=1.1
+    shm_size: "2g"
     environment:
       POSTGRES_DB: osm
       POSTGRES_USER: osm

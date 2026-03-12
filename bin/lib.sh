@@ -359,6 +359,20 @@ oi_canonical_db_updatable() {
   esac
 }
 
+oi_assert_canonical_import_ready() {
+  local table_exists has_rows
+
+  table_exists="$(oi_db_query "SELECT CASE WHEN to_regclass('public.osm2pgsql_v2_highways') IS NULL THEN 0 ELSE 1 END;" 2>/dev/null || true)"
+  if [[ "$table_exists" != "1" ]]; then
+    oi_die "canonical osm2pgsql import did not produce osm2pgsql_v2_highways"
+  fi
+
+  has_rows="$(oi_db_query "SELECT CASE WHEN EXISTS (SELECT 1 FROM osm2pgsql_v2_highways LIMIT 1) THEN 1 ELSE 0 END;" 2>/dev/null || true)"
+  if [[ "$has_rows" != "1" ]]; then
+    oi_die "canonical osm2pgsql import produced an empty highway table"
+  fi
+}
+
 oi_resolve_import_mode() {
   local requested_mode="${OSM2PGSQL_MODE:-auto}"
   local canonical_state="unknown"
@@ -483,6 +497,7 @@ oi_import_canonical() {
 
   oi_runner env PGPASSWORD="$OI_DB_PASSWORD" \
     osm2pgsql "${osm2pgsql_args[@]}" "$(oi_container_path "$import_pbf")"
+  oi_assert_canonical_import_ready
 
   printf '%s\n' "$import_pbf"
 }

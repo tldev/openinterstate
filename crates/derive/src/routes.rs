@@ -874,7 +874,10 @@ fn deterministic_route_id(
     waypoints_json: &str,
 ) -> Uuid {
     let digest = Sha256::digest(waypoints_json.as_bytes());
-    let key = format!("{}|{}|{}|{:x}", highway, direction_code, corridor_id, digest);
+    let key = format!(
+        "{}|{}|{}|{:x}",
+        highway, direction_code, corridor_id, digest
+    );
     let namespace = Uuid::from_u128(0x0f186e5eb6ea4dc9bd5f6b52471221d8);
     Uuid::new_v5(&namespace, key.as_bytes())
 }

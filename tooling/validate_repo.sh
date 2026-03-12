@@ -37,3 +37,8 @@ required_files=(
 for file in "${required_files[@]}"; do
   test -f "$file"
 done
+
+bash -n bin/openinterstate bin/lib.sh tooling/validate_repo.sh
+python3 -m py_compile tooling/export_release.py
+cargo fmt --all --check
+cargo test --workspace --all-targets

@@ -11,7 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate required files
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Validate repository
         run: tooling/validate_repo.sh
 
       - name: Validate JSON files

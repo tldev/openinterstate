@@ -503,7 +503,10 @@ mod tests {
     use super::*;
 
     fn sample_exit(id: &str, osm_id: i64) -> ParsedExit {
-        ParsedExit { id: id.to_string(), osm_id }
+        ParsedExit {
+            id: id.to_string(),
+            osm_id,
+        }
     }
 
     fn sample_highway(

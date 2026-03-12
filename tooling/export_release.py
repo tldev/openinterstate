@@ -5,6 +5,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -14,7 +15,11 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import psycopg
 
 
-INTERSTATE_FILTER = r"^I-?[0-9]+$"
+# Keep the public release surface focused on official Interstate route numbers.
+# In addition to plain numeric routes (I-95), include the current signed
+# letter-suffixed branches that are part of the Interstate system.
+INTERSTATE_FILTER = r"^(?:I-?[0-9]+|I-?35[EW]|I-?69[CEW])$"
+INTERSTATE_NAME_RE = re.compile(INTERSTATE_FILTER)
 
 
 @dataclass(frozen=True)
@@ -23,6 +28,10 @@ class ExportSpec:
     filename: str
     query: str
     columns: list[str] | None = None
+
+
+def is_release_interstate_name(highway: str) -> bool:
+    return bool(INTERSTATE_NAME_RE.fullmatch(highway.strip().upper()))
 
 
 def parse_args() -> argparse.Namespace:
