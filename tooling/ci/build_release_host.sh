@@ -273,4 +273,7 @@ tar \
   "$RELEASE_ID"
 
 log "Release build complete"
-du -sh "$FILTERED_PBF_FILE" "$POSTGRES_DATA_DIR" "$RELEASE_DIR" "$ARCHIVE_PATH" >&2
+du -sh "$FILTERED_PBF_FILE" "$RELEASE_DIR" "$ARCHIVE_PATH" >&2
+if ! du -sh "$POSTGRES_DATA_DIR" >&2 2>/dev/null; then
+  log "Skipping postgres size summary; directory is owned by the container user"
+fi
