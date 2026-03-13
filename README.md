@@ -31,6 +31,10 @@ If your main disk is tight, move the managed data workspace onto another volume:
 With that command, working data and release artifacts both land under
 `/Volumes/goose-drive/openinterstate-data/`.
 
+Runner caches now follow the managed data root too, so Cargo registry/git
+state and the Rust target directory stay on the external volume instead of
+quietly growing inside Docker-managed local storage.
+
 If you want release artifacts in a separate folder, set an explicit release
 root:
 
@@ -40,6 +44,15 @@ root:
   --release-dir /Volumes/goose-drive/openinterstate-releases \
   build
 ```
+
+When the source PBF, import mapping, derive inputs, and release exporter are
+unchanged, repeated builds now skip the already-current stages instead of
+re-downloading or rebuilding them.
+
+Fresh builds are faster too: the canonical prefilter/import now keeps only the
+motorway/trunk road context and POI data needed for Interstate derivation, and
+the downstream Rust graph builders stay focused on Interstate-labeled corridors
+instead of constructing a much broader national highway graph.
 
 ## Repo Map
 

@@ -42,6 +42,10 @@ root:
   build
 ```
 
+Cargo and runner caches now default under the managed data root as well, so a
+goose-drive workspace keeps both data artifacts and Rust build cache off the
+main disk.
+
 ## Environment Setup
 
 The default local workflow works without any env file and stores working data in
@@ -86,6 +90,10 @@ If you want to run the pipeline in stages:
 
 If the database is already up to date, you can rerun just the `release` or
 `publish` steps without re-importing the source PBF.
+
+The main `build` command now also skips current download, filter, import,
+derive, and release stages when their inputs and build scripts have not
+changed.
 
 ## Current v1 Outputs
 

@@ -1,7 +1,7 @@
 use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet, VecDeque};
 
 use openinterstate_core::geo::haversine_distance;
-use openinterstate_core::highway_ref::normalize_highway_ref;
+use openinterstate_core::highway_ref::is_interstate_highway_ref;
 
 use crate::canonical_types::{ParsedExit, ParsedHighway};
 
@@ -126,14 +126,17 @@ fn group_ways_by_highway(highways: &[ParsedHighway]) -> HashMap<String, Vec<&Par
         if way.refs.is_empty() && way.highway_type == "motorway" {
             // Refless motorway ways (e.g. "Sam Cooper Boulevard" in Memphis is
             // physically I-40 but tagged without ref). Collect for node-based
-            // assignment in a second pass.
+            // assignment in a second pass onto an Interstate graph.
             refless_motorways.push(way);
             continue;
         }
 
         for reference in &way.refs {
-            if let Some(highway) = normalize_highway_ref(reference) {
-                ways_by_highway.entry(highway).or_default().push(way);
+            if is_interstate_highway_ref(reference) {
+                ways_by_highway
+                    .entry(reference.clone())
+                    .or_default()
+                    .push(way);
             }
         }
     }
@@ -578,5 +581,29 @@ mod tests {
 
         assert_eq!(edge_low.component, 0);
         assert_eq!(edge_high.component, 1);
+    }
+
+    #[test]
+    fn ignores_non_interstate_refs() {
+        let highways = vec![
+            sample_highway(
+                "way/1",
+                &["US-101"],
+                &[1, 2],
+                &[(37.0, -122.0), (37.001, -122.0)],
+            ),
+            sample_highway(
+                "way/2",
+                &["I-280"],
+                &[10, 11],
+                &[(37.4, -122.1), (37.401, -122.1)],
+            ),
+        ];
+
+        let (edges, corridor_entries) = compress_highway_graph(&highways, &[]);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].highway, "I-280");
+        assert!(corridor_entries.is_empty());
     }
 }

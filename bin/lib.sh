@@ -22,6 +22,93 @@ oi_require_cmd() {
   fi
 }
 
+oi_hash_stdin() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    sha256sum | awk '{print $1}'
+  fi
+}
+
+oi_hash_text() {
+  printf '%s' "$1" | oi_hash_stdin
+}
+
+oi_hash_files() {
+  if [[ $# -eq 0 ]]; then
+    oi_die "oi_hash_files requires at least one path"
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$@" | oi_hash_stdin
+  else
+    sha256sum "$@" | oi_hash_stdin
+  fi
+}
+
+oi_file_signature() {
+  local path="$1"
+  if stat -c '%n|%s|%Y' "$path" >/dev/null 2>&1; then
+    stat -c '%n|%s|%Y' "$path"
+  else
+    stat -f '%N|%z|%m' "$path"
+  fi
+}
+
+oi_file_size_bytes() {
+  local path="$1"
+  if stat -c '%s' "$path" >/dev/null 2>&1; then
+    stat -c '%s' "$path"
+  else
+    stat -f '%z' "$path"
+  fi
+}
+
+oi_state_file() {
+  local scope="$1"
+  local key="$2"
+  printf '%s/%s-%s.state\n' "$OI_STATE_DIR" "$scope" "$(oi_hash_text "$key")"
+}
+
+oi_state_read() {
+  local path="$1"
+  local key="$2"
+
+  [[ -f "$path" ]] || return 1
+  awk -F= -v wanted="$key" '
+    $1 == wanted {
+      sub($1 "=", "", $0)
+      print $0
+      exit 0
+    }
+  ' "$path"
+}
+
+oi_state_write() {
+  local path="$1"
+  shift
+  local tmp_path="${path}.tmp.$$"
+
+  mkdir -p "$(dirname "$path")"
+  : > "$tmp_path"
+  while [[ $# -gt 1 ]]; do
+    printf '%s=%s\n' "$1" "$2" >> "$tmp_path"
+    shift 2
+  done
+
+  mv "$tmp_path" "$path"
+}
+
+oi_cleanup_unused_flatnodes() {
+  local flatnodes_path="$1"
+
+  if [[ -f "$flatnodes_path" ]]; then
+    oi_log "Removing stale flatnodes cache"
+    echo "  path: $flatnodes_path" >&2
+    rm -f "$flatnodes_path"
+  fi
+}
+
 oi_is_truthy() {
   case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
     1|true|yes|y|on)
@@ -71,6 +158,9 @@ oi_set_defaults() {
   OSM2PGSQL_MODE="${OSM2PGSQL_MODE:-auto}"
   OSM2PGSQL_DROP_MIDDLE="${OSM2PGSQL_DROP_MIDDLE:-false}"
   OI_ALLOW_CANONICAL_RESET="${OI_ALLOW_CANONICAL_RESET:-false}"
+  OI_FLATNODES_MODE="${OI_FLATNODES_MODE:-auto}"
+  OI_FLATNODES_AUTO_MAX_PBF_MB="${OI_FLATNODES_AUTO_MAX_PBF_MB:-1024}"
+  OI_IMPORT_CACHE_MB="${OI_IMPORT_CACHE_MB:-2048}"
 
   OI_DB_NAME="${OI_DB_NAME:-osm}"
   OI_DB_USER="${OI_DB_USER:-osm}"
@@ -85,11 +175,18 @@ oi_set_defaults() {
   OI_FLATNODES_DIR="$(oi_abs_path "${OI_FLATNODES_DIR:-$OI_DATA_ROOT/flatnodes}")"
   OI_DOWNLOAD_DIR="$(oi_abs_path "${OI_DOWNLOAD_DIR:-$OI_DATA_ROOT/downloads}")"
   OI_FILTERED_DIR="$(oi_abs_path "${OI_FILTERED_DIR:-$OI_DATA_ROOT/filtered}")"
+  OI_STATE_DIR="$(oi_abs_path "${OI_STATE_DIR:-$OI_DATA_ROOT/state}")"
+  OI_CACHE_DIR="$(oi_abs_path "${OI_CACHE_DIR:-$OI_DATA_ROOT/cache}")"
+  OI_CARGO_REGISTRY_DIR="$(oi_abs_path "${OI_CARGO_REGISTRY_DIR:-$OI_CACHE_DIR/cargo/registry}")"
+  OI_CARGO_GIT_DIR="$(oi_abs_path "${OI_CARGO_GIT_DIR:-$OI_CACHE_DIR/cargo/git}")"
+  OI_CARGO_TARGET_DIR="$(oi_abs_path "${OI_CARGO_TARGET_DIR:-$OI_CACHE_DIR/cargo/target}")"
   OI_RELEASE_DIR="$(oi_abs_path "${OI_RELEASE_DIR:-${OI_BUILD_DIR:-$OI_DATA_ROOT/releases}}")"
   OI_BUILD_DIR="$OI_RELEASE_DIR"
 
   export OI_DB_PORT
-  export OI_DATA_ROOT OI_POSTGRES_DIR OI_FLATNODES_DIR OI_DOWNLOAD_DIR OI_FILTERED_DIR OI_RELEASE_DIR OI_BUILD_DIR
+  export OI_DATA_ROOT OI_POSTGRES_DIR OI_FLATNODES_DIR OI_DOWNLOAD_DIR OI_FILTERED_DIR
+  export OI_STATE_DIR OI_CACHE_DIR OI_CARGO_REGISTRY_DIR OI_CARGO_GIT_DIR OI_CARGO_TARGET_DIR
+  export OI_RELEASE_DIR OI_BUILD_DIR OI_FLATNODES_MODE OI_FLATNODES_AUTO_MAX_PBF_MB OI_IMPORT_CACHE_MB
 }
 
 oi_prepare_dirs() {
@@ -99,6 +196,11 @@ oi_prepare_dirs() {
     "$OI_FLATNODES_DIR" \
     "$OI_DOWNLOAD_DIR" \
     "$OI_FILTERED_DIR" \
+    "$OI_STATE_DIR" \
+    "$OI_CACHE_DIR" \
+    "$OI_CARGO_REGISTRY_DIR" \
+    "$OI_CARGO_GIT_DIR" \
+    "$OI_CARGO_TARGET_DIR" \
     "$OI_RELEASE_DIR"
 }
 
@@ -275,6 +377,7 @@ oi_download_pbf() {
   local source_url="$1"
   local output_path="${2:-}"
   local resolved_output
+  local -a curl_args=()
 
   if [[ -z "$output_path" ]]; then
     resolved_output="$OI_DOWNLOAD_DIR/$(basename "$source_url")"
@@ -284,11 +387,21 @@ oi_download_pbf() {
 
   mkdir -p "$(dirname "$resolved_output")"
 
-  oi_log "Downloading source PBF"
+  oi_log "Resolving source PBF"
   echo "  url: $source_url" >&2
   echo "  output: $resolved_output" >&2
 
-  oi_runner curl -L --fail --progress-bar "$source_url" -o "$(oi_container_path "$resolved_output")"
+  curl_args=(
+    -L
+    --fail
+    --progress-bar
+    --remote-time
+  )
+  if [[ -f "$resolved_output" ]]; then
+    curl_args+=(-z "$(oi_container_path "$resolved_output")")
+  fi
+
+  oi_runner curl "${curl_args[@]}" "$source_url" -o "$(oi_container_path "$resolved_output")"
   printf '%s\n' "$resolved_output"
 }
 
@@ -297,6 +410,8 @@ oi_filter_pbf() {
   local output_pbf="$2"
   local force="${3:-false}"
   local output_tmp
+  local state_file expected_signature
+  local -a filter_args=()
 
   input_pbf="$(oi_stage_input_file "$input_pbf")"
   output_pbf="$(oi_managed_path "$output_pbf")"
@@ -306,11 +421,39 @@ oi_filter_pbf() {
   fi
 
   mkdir -p "$(dirname "$output_pbf")"
-  if [[ "$force" != true && -s "$output_pbf" && ! "$input_pbf" -nt "$output_pbf" ]]; then
-    oi_log "Skipping canonical filter; output is current"
-    echo "  output: $output_pbf" >&2
-    printf '%s\n' "$output_pbf"
-    return 0
+  filter_args=(
+    n/highway=motorway_junction
+    n/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station
+    n/tourism=hotel,motel,guest_house
+    n/shop=gas
+    n/cuisine
+    n/highway=rest_area,services
+    w/highway=motorway,motorway_link,trunk,trunk_link,rest_area,services
+    w/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station
+    w/tourism=hotel,motel,guest_house
+    w/shop=gas
+    w/cuisine
+  )
+  state_file="$(oi_state_file filter "$output_pbf")"
+  expected_signature="$(
+    {
+      oi_file_signature "$input_pbf"
+      printf '%s\n' "${filter_args[@]}"
+    } | oi_hash_stdin
+  )"
+  if [[ "$force" != true && -s "$output_pbf" ]]; then
+    if [[ "$(oi_state_read "$state_file" signature 2>/dev/null || true)" == "$expected_signature" ]] \
+      || [[ ! "$input_pbf" -nt "$output_pbf" ]]; then
+      oi_log "Skipping canonical filter; output is current"
+      echo "  output: $output_pbf" >&2
+      oi_state_write "$state_file" \
+        signature "$expected_signature" \
+        input_pbf "$input_pbf" \
+        output_pbf "$output_pbf" \
+        completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      printf '%s\n' "$output_pbf"
+      return 0
+    fi
   fi
 
   if [[ "$output_pbf" == *.osm.pbf ]]; then
@@ -325,21 +468,16 @@ oi_filter_pbf() {
 
   oi_runner osmium tags-filter \
     "$(oi_container_path "$input_pbf")" \
-    n/highway=motorway_junction \
-    n/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station \
-    n/tourism=hotel,motel,guest_house \
-    n/shop=gas \
-    n/cuisine \
-    n/highway=rest_area,services \
-    w/highway=motorway,motorway_link,trunk,trunk_link,primary,primary_link,rest_area,services \
-    w/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station \
-    w/tourism=hotel,motel,guest_house \
-    w/shop=gas \
-    w/cuisine \
+    "${filter_args[@]}" \
     --overwrite \
     -o "$(oi_container_path "$output_tmp")"
 
   mv "$output_tmp" "$output_pbf"
+  oi_state_write "$state_file" \
+    signature "$expected_signature" \
+    input_pbf "$input_pbf" \
+    output_pbf "$output_pbf" \
+    completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf '%s\n' "$output_pbf"
 }
 
@@ -371,6 +509,23 @@ oi_assert_canonical_import_ready() {
   if [[ "$has_rows" != "1" ]]; then
     oi_die "canonical osm2pgsql import produced an empty highway table"
   fi
+}
+
+oi_derive_outputs_ready() {
+  local exists
+
+  exists="$(
+    oi_db_query "
+      SELECT CASE
+        WHEN to_regclass('public.highway_edges') IS NOT NULL
+         AND to_regclass('public.corridors') IS NOT NULL
+         AND to_regclass('public.corridor_exits') IS NOT NULL
+         AND to_regclass('public.reference_routes') IS NOT NULL
+        THEN 1 ELSE 0
+      END;
+    " 2>/dev/null || true
+  )"
+  [[ "$exists" == "1" ]]
 }
 
 oi_resolve_import_mode() {
@@ -423,6 +578,9 @@ oi_import_canonical() {
   local force_prefilter="${3:-false}"
   local import_pbf pbf_basename pbf_stem filtered_output import_mode
   local flatnodes_path drop_middle mapping_file
+  local import_state_file import_signature import_size_bytes
+  local use_flatnodes=false flatnodes_mode threshold_bytes
+  local cache_mb
   local -a osm2pgsql_args=()
 
   source_pbf="$(oi_stage_input_file "$source_pbf")"
@@ -465,11 +623,53 @@ oi_import_canonical() {
   fi
   flatnodes_path="$OI_FLATNODES_DIR/${OI_DB_NAME}_${pbf_stem}.flatnodes.bin"
   drop_middle="${OSM2PGSQL_DROP_MIDDLE:-false}"
+  flatnodes_mode="${OI_FLATNODES_MODE:-auto}"
+  cache_mb="${OI_IMPORT_CACHE_MB:-2048}"
+  import_size_bytes="$(oi_file_size_bytes "$import_pbf")"
+  threshold_bytes=$(( ${OI_FLATNODES_AUTO_MAX_PBF_MB:-1024} * 1024 * 1024 ))
+  import_state_file="$(oi_state_file import "$OI_DATA_ROOT|$OI_DB_NAME")"
+  import_signature="$(
+    {
+      oi_file_signature "$import_pbf"
+      printf 'mapping=%s\n' "$(oi_hash_files "$mapping_file")"
+      printf 'mode=%s\n' "$import_mode"
+      printf 'drop_middle=%s\n' "$drop_middle"
+      printf 'flatnodes_mode=%s\n' "$flatnodes_mode"
+      printf 'cache_mb=%s\n' "$cache_mb"
+    } | oi_hash_stdin
+  )"
+
+  case "$flatnodes_mode" in
+    always)
+      use_flatnodes=true
+      ;;
+    never)
+      use_flatnodes=false
+      ;;
+    auto)
+      if (( import_size_bytes > threshold_bytes )); then
+        use_flatnodes=true
+      fi
+      ;;
+    *)
+      oi_die "invalid OI_FLATNODES_MODE=$flatnodes_mode (expected auto|always|never)"
+      ;;
+  esac
+
+  if [[ "$use_flatnodes" != true ]]; then
+    oi_cleanup_unused_flatnodes "$flatnodes_path"
+  fi
+
+  if oi_canonical_tables_exist && [[ "$(oi_state_read "$import_state_file" signature 2>/dev/null || true)" == "$import_signature" ]]; then
+    oi_assert_canonical_import_ready
+    oi_log "Skipping canonical osm2pgsql import; input and mapping are unchanged"
+    echo "  input: $import_pbf" >&2
+    printf '%s\n' "$import_pbf"
+    return 0
+  fi
 
   osm2pgsql_args=(
     --slim
-    --cache=0
-    --flat-nodes="$(oi_container_path "$flatnodes_path")"
     --output=flex
     --style="$(oi_container_path "$mapping_file")"
     --database="$OI_DB_NAME"
@@ -490,22 +690,80 @@ oi_import_canonical() {
       ;;
   esac
 
+  if [[ "$use_flatnodes" == true ]]; then
+    osm2pgsql_args+=(--cache=0 --flat-nodes="$(oi_container_path "$flatnodes_path")")
+  else
+    osm2pgsql_args+=(--cache="$cache_mb")
+  fi
+
   oi_log "Running canonical osm2pgsql import"
   echo "  mode: $import_mode" >&2
   echo "  input: $import_pbf" >&2
   echo "  mapping: $mapping_file" >&2
+  if [[ "$use_flatnodes" == true ]]; then
+    echo "  flatnodes: $flatnodes_path" >&2
+  else
+    echo "  flatnodes: disabled (cache=${cache_mb}MB)" >&2
+  fi
 
   oi_runner env PGPASSWORD="$OI_DB_PASSWORD" \
     osm2pgsql "${osm2pgsql_args[@]}" "$(oi_container_path "$import_pbf")"
   oi_assert_canonical_import_ready
+  oi_state_write "$import_state_file" \
+    signature "$import_signature" \
+    import_pbf "$import_pbf" \
+    mode "$import_mode" \
+    use_flatnodes "$use_flatnodes" \
+    completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
   printf '%s\n' "$import_pbf"
 }
 
 oi_apply_derive() {
   local derive_file="$REPO_ROOT/schema/derive.sql"
+  local derive_state_file import_state_file import_signature derive_signature derive_sql_signature derive_code_signature
+  local reachability_signature
+  local -a derive_source_files=()
 
   oi_guard_no_reachability_clears "$derive_file"
+
+  import_state_file="$(oi_state_file import "$OI_DATA_ROOT|$OI_DB_NAME")"
+  import_signature="$(oi_state_read "$import_state_file" signature 2>/dev/null || true)"
+  [[ -n "$import_signature" ]] || import_signature="no-import-state"
+
+  derive_state_file="$(oi_state_file derive "$OI_DATA_ROOT|$OI_DB_NAME")"
+  derive_source_files=(
+    "$REPO_ROOT/Cargo.toml"
+    "$REPO_ROOT/Cargo.lock"
+    "$REPO_ROOT/crates/core/Cargo.toml"
+    "$REPO_ROOT/crates/derive/Cargo.toml"
+  )
+  while IFS= read -r rel_path; do
+    derive_source_files+=("$REPO_ROOT/$rel_path")
+  done < <(
+    cd "$REPO_ROOT" && find crates/core/src crates/derive/src -type f -name '*.rs' | LC_ALL=C sort
+  )
+  derive_sql_signature="$(oi_hash_files "$derive_file")"
+  derive_code_signature="$(oi_hash_files "${derive_source_files[@]}")"
+  reachability_signature="$(
+    {
+      oi_db_query "SELECT COUNT(*), COALESCE(MAX(updated_at)::text, '') FROM exit_poi_reachability;" 2>/dev/null || true
+      oi_db_query "SELECT COUNT(*), COALESCE(MAX(updated_at)::text, '') FROM osrm_snap_hints;" 2>/dev/null || true
+    } | oi_hash_stdin
+  )"
+  derive_signature="$(
+    {
+      printf 'import=%s\n' "$import_signature"
+      printf 'derive_sql=%s\n' "$derive_sql_signature"
+      printf 'derive_code=%s\n' "$derive_code_signature"
+      printf 'reachability=%s\n' "$reachability_signature"
+    } | oi_hash_stdin
+  )"
+
+  if oi_derive_outputs_ready && [[ "$(oi_state_read "$derive_state_file" signature 2>/dev/null || true)" == "$derive_signature" ]]; then
+    oi_log "Skipping derive; SQL and Rust builders are unchanged"
+    return 0
+  fi
 
   oi_log "Applying deterministic SQL projection"
   oi_db_exec psql -U "$OI_DB_USER" -d "$OI_DB_NAME" -v ON_ERROR_STOP=1 < "$derive_file"
@@ -514,6 +772,10 @@ oi_apply_derive() {
   oi_runner cargo run --release -p openinterstate-derive -- \
     --database-url "$PRODUCT_DB_URL" \
     all
+  oi_state_write "$derive_state_file" \
+    signature "$derive_signature" \
+    import_signature "$import_signature" \
+    completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 
 oi_export_release() {
@@ -523,6 +785,7 @@ oi_export_release() {
   local source_url="${4:-}"
   local output_root="${5:-$OI_RELEASE_DIR}"
   local output_dir archive_path
+  local release_state_file export_signature derive_state_file derive_signature exporter_signature
   local -a export_args
 
   source_pbf="$(oi_stage_input_file "$source_pbf")"
@@ -530,8 +793,30 @@ oi_export_release() {
   output_root="$(oi_managed_path "$output_root")"
   output_dir="$output_root/$release_id"
   archive_path="$output_root/openinterstate-$release_id.tar.gz"
+  release_state_file="$(oi_state_file release "$output_dir")"
+  derive_state_file="$(oi_state_file derive "$OI_DATA_ROOT|$OI_DB_NAME")"
+  derive_signature="$(oi_state_read "$derive_state_file" signature 2>/dev/null || true)"
+  exporter_signature="$(oi_hash_files "$REPO_ROOT/tooling/export_release.py")"
+  export_signature="$(
+    {
+      printf 'release_id=%s\n' "$release_id"
+      printf 'source=%s\n' "$(oi_file_signature "$source_pbf")"
+      printf 'import=%s\n' "$(oi_file_signature "$import_pbf")"
+      printf 'source_url=%s\n' "$source_url"
+      printf 'derive=%s\n' "$derive_signature"
+      printf 'exporter=%s\n' "$exporter_signature"
+    } | oi_hash_stdin
+  )"
 
   mkdir -p "$output_root"
+
+  if [[ "$(oi_state_read "$release_state_file" signature 2>/dev/null || true)" == "$export_signature" ]] \
+    && [[ -d "$output_dir" && -f "$archive_path" && -f "$output_dir/manifest.json" && -f "$output_dir/checksums.txt" && -f "$output_dir/source_lineage.json" ]]; then
+    oi_log "Skipping release export; artifacts are current"
+    echo "  release id: $release_id" >&2
+    echo "  output dir: $output_dir" >&2
+    return 0
+  fi
 
   oi_log "Exporting release artifacts"
   echo "  release id: $release_id" >&2
@@ -543,6 +828,7 @@ oi_export_release() {
     --database-url "$PRODUCT_DB_URL"
     --release-id "$release_id"
     --output-dir "$(oi_container_path "$output_dir")"
+    --state-dir "$(oi_container_path "$OI_STATE_DIR")"
     --source-pbf-file "$(oi_container_path "$source_pbf")"
     --import-pbf-file "$(oi_container_path "$import_pbf")"
   )
@@ -563,6 +849,12 @@ oi_export_release() {
     -C "$(oi_container_path "$output_root")" \
     -czf "$(oi_container_path "$archive_path")" \
     "$release_id"
+  oi_state_write "$release_state_file" \
+    signature "$export_signature" \
+    release_id "$release_id" \
+    output_dir "$output_dir" \
+    archive_path "$archive_path" \
+    completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 }
 
 oi_publish_release() {

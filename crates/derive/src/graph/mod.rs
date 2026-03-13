@@ -3,7 +3,7 @@ mod compress;
 pub mod corridors;
 mod directions;
 
-use openinterstate_core::highway_ref::normalize_highway_ref;
+use openinterstate_core::highway_ref::{is_interstate_highway_ref, normalize_highway_ref};
 use sqlx::PgPool;
 
 use crate::canonical_types::{ParsedExit, ParsedHighway};
@@ -128,7 +128,13 @@ async fn load_highways(pool: &PgPool) -> Result<Vec<ParsedHighway>, anyhow::Erro
         "SELECT way_id, highway, ref, oneway, node_ids, \
          ST_AsGeoJSON(geom)::text \
          FROM osm2pgsql_v2_highways \
-         WHERE node_ids IS NOT NULL AND array_length(node_ids, 1) >= 2",
+         WHERE highway IN ('motorway', 'trunk') \
+           AND node_ids IS NOT NULL \
+           AND array_length(node_ids, 1) >= 2 \
+           AND ( \
+             highway = 'motorway' \
+             OR COALESCE(NULLIF(BTRIM(ref), ''), NULLIF(BTRIM(tags ->> 'ref'), '')) IS NOT NULL \
+           )",
     )
     .fetch_all(pool)
     .await?;
@@ -151,6 +157,19 @@ async fn load_highways(pool: &PgPool) -> Result<Vec<ParsedHighway>, anyhow::Erro
         } else {
             Vec::new()
         };
+        let has_interstate_ref = refs
+            .iter()
+            .any(|reference| is_interstate_highway_ref(reference));
+        let has_explicit_ref = ref_raw
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+
+        match highway_type.as_str() {
+            "motorway" if !has_interstate_ref && has_explicit_ref => continue,
+            "trunk" if !has_interstate_ref => continue,
+            _ => {}
+        }
 
         let geometry = parse_geojson_coords(&geojson);
         if geometry.len() < 2 || geometry.len() != node_ids.len() {

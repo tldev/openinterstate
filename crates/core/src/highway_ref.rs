@@ -29,6 +29,11 @@ pub fn normalize_highway_ref(raw: &str) -> Option<String> {
     Some(s)
 }
 
+/// Return true when a normalized or raw highway reference denotes an Interstate.
+pub fn is_interstate_highway_ref(value: &str) -> bool {
+    parse_interstate(value).is_some()
+}
+
 fn parse_interstate(s: &str) -> Option<&str> {
     let s = s.as_bytes();
     if s.is_empty() {
@@ -161,5 +166,13 @@ mod tests {
     #[test]
     fn test_suffix_letter() {
         assert_eq!(normalize_highway_ref("I-95A"), Some("I-95A".into()));
+    }
+
+    #[test]
+    fn test_is_interstate_highway_ref() {
+        assert!(is_interstate_highway_ref("I-95"));
+        assert!(is_interstate_highway_ref("I 10"));
+        assert!(!is_interstate_highway_ref("US-101"));
+        assert!(!is_interstate_highway_ref("FL-91 Toll"));
     }
 }

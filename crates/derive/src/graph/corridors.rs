@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use openinterstate_core::geo::haversine_distance;
+use openinterstate_core::highway_ref::is_interstate_highway_ref;
 use sqlx::PgPool;
 
 // ============================================================================
@@ -239,6 +240,7 @@ async fn load_edges(pool: &PgPool) -> Result<Vec<EdgeData>, anyhow::Error> {
          ST_Y(ST_StartPoint(geom)) as start_lat, ST_X(ST_StartPoint(geom)) as start_lon, \
          ST_Y(ST_EndPoint(geom)) as end_lat, ST_X(ST_EndPoint(geom)) as end_lon \
          FROM highway_edges \
+         WHERE highway LIKE 'I-%' \
          ORDER BY highway, component, id",
     )
     .fetch_all(pool)
@@ -268,6 +270,7 @@ async fn load_exits(pool: &PgPool) -> Result<Vec<(String, Vec<ExitData>)>, anyho
          e.ref, e.name, ST_Y(e.geom) as lat, ST_X(e.geom) as lon \
          FROM exit_corridors ec \
          JOIN exits e ON e.id = ec.exit_id \
+         WHERE ec.highway LIKE 'I-%' \
          ORDER BY ec.highway, ec.graph_component",
     )
     .fetch_all(pool)
@@ -308,16 +311,18 @@ async fn load_motorway_link_bridges(
            SELECT he.highway, he.component, \
                   he.start_node AS node, ST_StartPoint(he.geom) AS pt \
            FROM highway_edges he \
-           WHERE NOT EXISTS ( \
-             SELECT 1 FROM highway_edges he2 \
-             WHERE he2.highway = he.highway AND he2.component = he.component \
-               AND he2.end_node = he.start_node \
+           WHERE he.highway LIKE 'I-%' \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM highway_edges he2 \
+               WHERE he2.highway = he.highway AND he2.component = he.component \
+                 AND he2.end_node = he.start_node \
            ) \
            UNION ALL \
            SELECT he.highway, he.component, \
                   he.end_node AS node, ST_EndPoint(he.geom) AS pt \
            FROM highway_edges he \
-           WHERE NOT EXISTS ( \
+           WHERE he.highway LIKE 'I-%' \
+             AND NOT EXISTS ( \
              SELECT 1 FROM highway_edges he2 \
              WHERE he2.highway = he.highway AND he2.component = he.component \
                AND he2.start_node = he.end_node \
@@ -328,7 +333,7 @@ async fn load_motorway_link_bridges(
            FROM terminal_nodes t \
            WHERE EXISTS ( \
              SELECT 1 FROM osm2pgsql_v2_highways ml \
-             WHERE ml.tags->>'highway' = 'motorway_link' \
+             WHERE ml.highway = 'motorway_link' \
                AND ml.ref IS NOT NULL \
                AND ml.ref LIKE '%' || REPLACE(t.highway, '-', ' ') || '%' \
                AND ST_DWithin(ml.geom::geography, t.pt::geography, 100) \
@@ -362,6 +367,7 @@ async fn load_refd_link_endpoints(pool: &PgPool) -> Result<Vec<(String, i64, i64
          FROM osm2pgsql_v2_highways \
          WHERE highway = 'motorway_link' \
            AND ref IS NOT NULL \
+           AND ref ~* '(^|;)[[:space:]]*I[ -]?[0-9]' \
            AND array_length(node_ids, 1) >= 2",
     )
     .fetch_all(pool)
@@ -379,6 +385,9 @@ async fn load_refd_link_endpoints(pool: &PgPool) -> Result<Vec<(String, i64, i64
             if let Some(normalized) =
                 openinterstate_core::highway_ref::normalize_highway_ref(part.trim())
             {
+                if !is_interstate_highway_ref(&normalized) {
+                    continue;
+                }
                 result.push((normalized, first, last));
             }
         }

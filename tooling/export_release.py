@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--database-url", required=True)
     parser.add_argument("--release-id", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--state-dir")
     parser.add_argument("--source-pbf-file", required=True)
     parser.add_argument("--import-pbf-file")
     parser.add_argument("--source-url")
@@ -80,30 +81,73 @@ def write_csv(rows: list[dict[str, Any]], fieldnames: list[str], path: Path) -> 
             writer.writerow(row)
 
 
-def sha256_file(path: Path) -> str:
+def sha256_file(path: Path, hash_cache: dict[tuple[str, int, int], str] | None = None) -> str:
+    stat = path.stat()
+    cache_key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+    if hash_cache is not None and cache_key in hash_cache:
+        return hash_cache[cache_key]
+
     digest = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
-    return digest.hexdigest()
+    sha = digest.hexdigest()
+    if hash_cache is not None:
+        hash_cache[cache_key] = sha
+    return sha
 
 
-def build_source_file_metadata(path: Path) -> dict[str, Any]:
+def metadata_cache_path(state_dir: Path, source_path: Path) -> Path:
+    cache_key = hashlib.sha256(str(source_path.resolve()).encode("utf-8")).hexdigest()
+    return state_dir / "file-metadata" / f"{cache_key}.json"
+
+
+def build_source_file_metadata(
+    path: Path,
+    state_dir: Path | None = None,
+    hash_cache: dict[tuple[str, int, int], str] | None = None,
+) -> dict[str, Any]:
     stat = path.stat()
-    return {
+    modified_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+
+    if state_dir is not None:
+        cache_path = metadata_cache_path(state_dir, path)
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                cached = None
+            if (
+                isinstance(cached, dict)
+                and cached.get("path") == str(path.resolve())
+                and cached.get("size_bytes") == stat.st_size
+                and cached.get("modified_at") == modified_at
+                and isinstance(cached.get("sha256"), str)
+            ):
+                return cached
+
+    metadata = {
         "path": str(path.resolve()),
         "filename": path.name,
         "size_bytes": stat.st_size,
-        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-        "sha256": sha256_file(path),
+        "modified_at": modified_at,
+        "sha256": sha256_file(path, hash_cache),
     }
+    if state_dir is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return metadata
 
 
-def write_checksums(files: list[Path], output_path: Path) -> None:
+def write_checksums(
+    files: list[Path],
+    output_path: Path,
+    hash_cache: dict[tuple[str, int, int], str] | None = None,
+) -> None:
     with output_path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh, delimiter=" ")
         for file_path in files:
-            writer.writerow([sha256_file(file_path), file_path.relative_to(output_path.parent).as_posix()])
+            writer.writerow([sha256_file(file_path, hash_cache), file_path.relative_to(output_path.parent).as_posix()])
 
 
 def route_waypoints_to_gpx(route: dict[str, Any]) -> str:
@@ -160,6 +204,7 @@ def build_manifest(
     files: list[Path],
     row_counts: dict[str, int],
     source_lineage: dict[str, Any],
+    hash_cache: dict[tuple[str, int, int], str] | None = None,
 ) -> dict[str, Any]:
     return {
         "release_id": release_id,
@@ -171,7 +216,7 @@ def build_manifest(
             {
                 "path": file_path.relative_to(output_dir).as_posix(),
                 "format": file_path.suffix.lstrip("."),
-                "sha256": sha256_file(file_path),
+                "sha256": sha256_file(file_path, hash_cache),
                 "size_bytes": file_path.stat().st_size,
             }
             for file_path in files
@@ -184,14 +229,16 @@ def build_manifest(
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir).resolve()
+    state_dir = Path(args.state_dir).resolve() if args.state_dir else None
     csv_dir, gpx_dir, examples_dir = ensure_dirs(output_dir)
     source_pbf_path = Path(args.source_pbf_file).resolve()
     import_pbf_path = Path(args.import_pbf_file).resolve() if args.import_pbf_file else source_pbf_path
+    hash_cache: dict[tuple[str, int, int], str] = {}
 
     source_lineage = {
         "source_url": args.source_url,
-        "source_pbf": build_source_file_metadata(source_pbf_path),
-        "import_pbf": build_source_file_metadata(import_pbf_path),
+        "source_pbf": build_source_file_metadata(source_pbf_path, state_dir, hash_cache),
+        "import_pbf": build_source_file_metadata(import_pbf_path, state_dir, hash_cache),
         "derivation": [
             "osm2pgsql flex import via schema/osm2pgsql/openinterstate.lua",
             "schema/derive.sql",
@@ -389,13 +436,13 @@ def main() -> None:
         lineage_path.write_text(json.dumps(source_lineage, indent=2), encoding="utf-8")
         written_files.append(lineage_path)
 
-        manifest = build_manifest(args.release_id, output_dir, written_files, row_counts, source_lineage)
+        manifest = build_manifest(args.release_id, output_dir, written_files, row_counts, source_lineage, hash_cache)
         manifest_path = output_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         written_files.append(manifest_path)
 
         checksums_path = output_dir / "checksums.txt"
-        write_checksums(written_files, checksums_path)
+        write_checksums(written_files, checksums_path, hash_cache)
 
 
 if __name__ == "__main__":

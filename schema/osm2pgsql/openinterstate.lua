@@ -76,15 +76,6 @@ local function is_highway_class(v)
         or v == "motorway_link"
         or v == "trunk"
         or v == "trunk_link"
-        or v == "primary"
-        or v == "primary_link"
-        or v == "secondary"
-        or v == "secondary_link"
-        or v == "tertiary"
-        or v == "tertiary_link"
-        or v == "residential"
-        or v == "service"
-        or v == "unclassified"
 end
 
 function osm2pgsql.process_node(object)
