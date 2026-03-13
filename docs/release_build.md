@@ -53,14 +53,14 @@ The repo also includes a manual GitHub Actions workflow at
 
 That workflow is designed for standard public GitHub-hosted runners:
 
-1. stream the raw U.S. PBF directly into `osmium tags-filter`
+1. download the raw U.S. PBF into temporary runner storage
 2. persist only the filtered canonical import PBF plus source metadata as an artifact
 3. rebuild PostGIS, derive product tables, and export the release from that filtered artifact
 4. optionally publish the archive and companion metadata files to GitHub Releases
 
-This avoids storing the full raw `us-latest.osm.pbf` on the runner, which is
-the difference between fitting and not fitting inside the default runner disk
-budget.
+The raw source file is deleted after filtering and is never passed between jobs
+as an artifact. The only persisted handoff is the filtered canonical import PBF
+plus its source metadata.
 
 ## Environment Setup
 

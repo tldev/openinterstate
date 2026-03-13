@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--url", required=True)
     parser.add_argument("--metadata-file", required=True)
+    parser.add_argument("--output-file")
     parser.add_argument("--chunk-size", type=int, default=1024 * 1024)
     return parser.parse_args()
 
@@ -44,19 +45,31 @@ def main() -> int:
     request = Request(args.url, headers={"User-Agent": "openinterstate-ci/1"})
     digest = hashlib.sha256()
     size_bytes = 0
+    output_path = Path(args.output_file).resolve() if args.output_file else None
 
     try:
         with urlopen(request) as response:
             final_url = response.geturl()
             modified_at = isoformat_http_date(response.headers.get("Last-Modified"))
-            while True:
-                chunk = response.read(args.chunk_size)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                size_bytes += len(chunk)
-                sys.stdout.buffer.write(chunk)
-        sys.stdout.buffer.flush()
+            if output_path is not None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with output_path.open("wb") as output_fh:
+                    while True:
+                        chunk = response.read(args.chunk_size)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        size_bytes += len(chunk)
+                        output_fh.write(chunk)
+            else:
+                while True:
+                    chunk = response.read(args.chunk_size)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size_bytes += len(chunk)
+                    sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
     except BrokenPipeError:
         print("downstream consumer closed while streaming source PBF", file=sys.stderr)
         return 1

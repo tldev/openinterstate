@@ -31,6 +31,7 @@ require_cmd() {
 SOURCE_URL=""
 OUTPUT_PBF=""
 SOURCE_METADATA_FILE=""
+RAW_PBF=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -66,6 +67,13 @@ require_cmd python3
 
 mkdir -p "$(dirname "$OUTPUT_PBF")" "$(dirname "$SOURCE_METADATA_FILE")"
 
+cleanup() {
+  if [[ -n "$RAW_PBF" && -f "$RAW_PBF" ]]; then
+    rm -f "$RAW_PBF"
+  fi
+}
+trap cleanup EXIT
+
 # shellcheck disable=SC1091
 source "$REPO_ROOT/bin/lib.sh"
 
@@ -73,17 +81,20 @@ log "Free space before streamed prefilter"
 df -h "$(dirname "$OUTPUT_PBF")" >&2
 
 mapfile -t FILTER_ARGS < <(oi_canonical_filter_args)
+RAW_PBF="$(mktemp "${TMPDIR:-/tmp}/openinterstate-source-XXXXXX.osm.pbf")"
 
-log "Streaming raw source PBF into canonical filter"
+log "Downloading raw source PBF to ephemeral runner storage"
 python3 "$REPO_ROOT/tooling/ci/stream_source_pbf.py" \
   --url "$SOURCE_URL" \
   --metadata-file "$SOURCE_METADATA_FILE" \
-  | osmium tags-filter \
-      -F pbf \
-      - \
-      "${FILTER_ARGS[@]}" \
-      --overwrite \
-      -o "$OUTPUT_PBF"
+  --output-file "$RAW_PBF"
+
+log "Filtering canonical import PBF"
+osmium tags-filter \
+  "$RAW_PBF" \
+  "${FILTER_ARGS[@]}" \
+  --overwrite \
+  -o "$OUTPUT_PBF"
 
 [[ -s "$OUTPUT_PBF" ]] || die "filtered PBF is empty: $OUTPUT_PBF"
 osmium fileinfo "$OUTPUT_PBF" >/dev/null

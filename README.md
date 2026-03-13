@@ -61,14 +61,14 @@ The repo now carries a manual GitHub Actions release workflow at
 
 That workflow is shaped to fit standard public GitHub-hosted runners:
 
-1. stream the raw `us-latest.osm.pbf` directly into the canonical filter
+1. download the raw `us-latest.osm.pbf` into short-lived runner storage
 2. upload only the filtered `~160 MB` import PBF plus source metadata
 3. rebuild PostGIS, derive tables, and export the release from that artifact
 4. optionally publish the archive, manifest, checksums, and source lineage to GitHub
 
-The key constraint is that the raw source PBF is never persisted on the runner,
-which keeps the downstream build small enough to stay inside the standard
-runner disk budget.
+The raw source PBF is deleted after filtering and is never published as an
+artifact, so the persisted handoff between jobs stays small even though the
+prefilter job uses temporary local disk.
 
 ## Repo Map
 
