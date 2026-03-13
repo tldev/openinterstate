@@ -54,6 +54,27 @@ motorway/trunk road context and POI data needed for Interstate derivation, and
 the downstream Rust graph builders stay focused on Interstate-labeled corridors
 instead of constructing a much broader national highway graph.
 
+## GitHub Actions Release Build
+
+The repo now carries a manual GitHub Actions release workflow at
+`.github/workflows/release-build.yml`.
+
+That workflow is shaped to fit standard public GitHub-hosted runners:
+
+1. download the raw `us-latest.osm.pbf` into short-lived runner storage
+2. upload only the filtered `~160 MB` import PBF plus source metadata
+3. rebuild PostGIS, derive tables, and export the release from that artifact
+4. optionally publish the archive, manifest, checksums, and source lineage to GitHub
+
+The raw source PBF is deleted after filtering and is never published as an
+artifact, so the persisted handoff between jobs stays small even though the
+prefilter job uses temporary local disk.
+
+The manual `workflow_dispatch` path targets the full U.S. source file. The
+`pull_request` path uses a smaller Rhode Island smoke-test extract so PR checks
+validate the workflow mechanics without paying the full release-build cost on
+every iteration.
+
 ## Repo Map
 
 - `bin/`: the local command-line entrypoint

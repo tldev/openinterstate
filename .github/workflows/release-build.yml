@@ -1,0 +1,176 @@
+name: Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: "Optional release tag. Defaults to a dated GitHub Actions tag."
+        required: false
+        type: string
+      source_url:
+        description: "Source U.S. PBF URL"
+        required: false
+        default: "https://download.geofabrik.de/north-america/us-latest.osm.pbf"
+        type: string
+      publish:
+        description: "Publish the built assets as a GitHub release"
+        required: false
+        default: false
+        type: boolean
+  pull_request:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/release-build.yml"
+      - "bin/lib.sh"
+      - "schema/bootstrap.sql"
+      - "schema/derive.sql"
+      - "schema/osm2pgsql/openinterstate.lua"
+      - "tooling/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prefilter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      release_id: ${{ steps.meta.outputs.release_id }}
+      source_url: ${{ steps.meta.outputs.source_url }}
+      filtered_filename: ${{ steps.meta.outputs.filtered_filename }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          RELEASE_INPUT: ${{ inputs.release_id || '' }}
+          SOURCE_URL_INPUT: ${{ inputs.source_url || 'https://download.geofabrik.de/north-america/us-latest.osm.pbf' }}
+        run: |
+          release_input="$RELEASE_INPUT"
+          if [[ -n "$release_input" ]]; then
+            release_id="$release_input"
+          else
+            release_id="release-$(date -u +%F)-gha-${GITHUB_RUN_NUMBER}"
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            source_url="https://download.geofabrik.de/north-america/us/rhode-island-latest.osm.pbf"
+          else
+            source_url="$SOURCE_URL_INPUT"
+          fi
+          source_basename="$(basename "$source_url")"
+          filtered_filename="${source_basename%.osm.pbf}.canonical-filtered.osm.pbf"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
+          echo "source_url=$source_url" >> "$GITHUB_OUTPUT"
+          echo "filtered_filename=$filtered_filename" >> "$GITHUB_OUTPUT"
+
+      - name: Show disk budget
+        run: df -h .
+
+      - name: Install prefilter dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends osmium-tool
+
+      - name: Stream and filter the source PBF
+        run: |
+          mkdir -p ci-inputs
+          tooling/ci/prefilter_stream.sh \
+            --source-url "${{ steps.meta.outputs.source_url }}" \
+            --output-pbf "$PWD/ci-inputs/${{ steps.meta.outputs.filtered_filename }}" \
+            --source-metadata-file "$PWD/ci-inputs/source-pbf-metadata.json"
+
+      - name: Upload filtered build inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: prefiltered-${{ steps.meta.outputs.release_id }}
+          path: |
+            ci-inputs/${{ steps.meta.outputs.filtered_filename }}
+            ci-inputs/source-pbf-metadata.json
+          retention-days: 1
+          compression-level: 0
+
+  build-release:
+    needs: prefilter
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Show disk budget
+        run: df -h .
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends osm2pgsql postgresql-client
+
+      - name: Install tooling Python dependencies
+        run: |
+          python -m venv "$RUNNER_TEMP/openinterstate-venv"
+          "$RUNNER_TEMP/openinterstate-venv/bin/pip" install --upgrade pip
+          "$RUNNER_TEMP/openinterstate-venv/bin/pip" install -r tooling/requirements.txt
+          echo "$RUNNER_TEMP/openinterstate-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Download filtered build inputs
+        uses: actions/download-artifact@v4
+        with:
+          name: prefiltered-${{ needs.prefilter.outputs.release_id }}
+          path: ci-inputs
+
+      - name: Build release from filtered artifact
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-target
+        run: |
+          mkdir -p ci-artifacts/releases
+          tooling/ci/build_release_host.sh \
+            --release-id "${{ needs.prefilter.outputs.release_id }}" \
+            --filtered-pbf-file "$PWD/ci-inputs/${{ needs.prefilter.outputs.filtered_filename }}" \
+            --source-pbf-metadata-file "$PWD/ci-inputs/source-pbf-metadata.json" \
+            --source-url "${{ needs.prefilter.outputs.source_url }}" \
+            --output-root "$PWD/ci-artifacts/releases" \
+            --work-dir "$RUNNER_TEMP/openinterstate-release-build"
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ needs.prefilter.outputs.release_id }}
+          path: |
+            ci-artifacts/releases/${{ needs.prefilter.outputs.release_id }}
+            ci-artifacts/releases/openinterstate-${{ needs.prefilter.outputs.release_id }}.tar.gz
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    needs: [prefilter, build-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.prefilter.outputs.release_id }}
+          path: release-output
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tooling/ci/publish_release.sh \
+            --release-id "${{ needs.prefilter.outputs.release_id }}" \
+            --release-dir "$PWD/release-output/${{ needs.prefilter.outputs.release_id }}" \
+            --archive-file "$PWD/release-output/openinterstate-${{ needs.prefilter.outputs.release_id }}.tar.gz"
