@@ -17,6 +17,15 @@ on:
         required: false
         default: false
         type: boolean
+  pull_request:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/release-build.yml"
+      - "bin/lib.sh"
+      - "schema/bootstrap.sql"
+      - "schema/derive.sql"
+      - "schema/osm2pgsql/openinterstate.lua"
+      - "tooling/**"
 
 permissions:
   contents: write
@@ -39,15 +48,18 @@ jobs:
       - name: Resolve release metadata
         id: meta
         shell: bash
+        env:
+          RELEASE_INPUT: ${{ inputs.release_id || '' }}
+          SOURCE_URL_INPUT: ${{ inputs.source_url || 'https://download.geofabrik.de/north-america/us-latest.osm.pbf' }}
         run: |
-          release_input='${{ inputs.release_id }}'
+          release_input="$RELEASE_INPUT"
           if [[ -n "$release_input" ]]; then
             release_id="$release_input"
           else
             release_id="release-$(date -u +%F)-gha-${GITHUB_RUN_NUMBER}"
           fi
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
-          echo "source_url=${{ inputs.source_url }}" >> "$GITHUB_OUTPUT"
+          echo "source_url=$SOURCE_URL_INPUT" >> "$GITHUB_OUTPUT"
           echo "filtered_filename=us-latest.canonical-filtered.osm.pbf" >> "$GITHUB_OUTPUT"
 
       - name: Show disk budget
@@ -134,7 +146,7 @@ jobs:
           compression-level: 0
 
   publish:
-    if: ${{ inputs.publish }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
     needs: [prefilter, build-release]
     runs-on: ubuntu-latest
     timeout-minutes: 15
