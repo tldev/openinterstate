@@ -62,6 +62,10 @@ The raw source file is deleted after filtering and is never passed between jobs
 as an artifact. The only persisted handoff is the filtered canonical import PBF
 plus its source metadata.
 
+The manual `workflow_dispatch` run uses the full U.S. source by default. The
+`pull_request` trigger is intentionally lighter and uses a Rhode Island smoke
+test extract so release-workflow changes can be validated quickly in PRs.
+
 ## Environment Setup
 
 The default local workflow works without any env file and stores working data in

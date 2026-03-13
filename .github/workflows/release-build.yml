@@ -58,9 +58,16 @@ jobs:
           else
             release_id="release-$(date -u +%F)-gha-${GITHUB_RUN_NUMBER}"
           fi
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            source_url="https://download.geofabrik.de/north-america/us/rhode-island-latest.osm.pbf"
+          else
+            source_url="$SOURCE_URL_INPUT"
+          fi
+          source_basename="$(basename "$source_url")"
+          filtered_filename="${source_basename%.osm.pbf}.canonical-filtered.osm.pbf"
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
-          echo "source_url=$SOURCE_URL_INPUT" >> "$GITHUB_OUTPUT"
-          echo "filtered_filename=us-latest.canonical-filtered.osm.pbf" >> "$GITHUB_OUTPUT"
+          echo "source_url=$source_url" >> "$GITHUB_OUTPUT"
+          echo "filtered_filename=$filtered_filename" >> "$GITHUB_OUTPUT"
 
       - name: Show disk budget
         run: df -h .

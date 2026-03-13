@@ -70,6 +70,11 @@ The raw source PBF is deleted after filtering and is never published as an
 artifact, so the persisted handoff between jobs stays small even though the
 prefilter job uses temporary local disk.
 
+The manual `workflow_dispatch` path targets the full U.S. source file. The
+`pull_request` path uses a smaller Rhode Island smoke-test extract so PR checks
+validate the workflow mechanics without paying the full release-build cost on
+every iteration.
+
 ## Repo Map
 
 - `bin/`: the local command-line entrypoint
