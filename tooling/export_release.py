@@ -20,6 +20,7 @@ import psycopg
 # letter-suffixed branches that are part of the Interstate system.
 INTERSTATE_FILTER = r"^(?:I-?[0-9]+|I-?35[EW]|I-?69[CEW])$"
 INTERSTATE_NAME_RE = re.compile(INTERSTATE_FILTER)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -34,16 +35,24 @@ def is_release_interstate_name(highway: str) -> bool:
     return bool(INTERSTATE_NAME_RE.fullmatch(highway.strip().upper()))
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export OpenInterstate v1 release artifacts.")
     parser.add_argument("--database-url", required=True)
     parser.add_argument("--release-id", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--state-dir")
-    parser.add_argument("--source-pbf-file", required=True)
+    parser.add_argument("--source-pbf-file")
+    parser.add_argument("--source-pbf-metadata-file")
     parser.add_argument("--import-pbf-file")
     parser.add_argument("--source-url")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    has_source_file = bool(args.source_pbf_file)
+    has_source_metadata = bool(args.source_pbf_metadata_file)
+    if has_source_file == has_source_metadata:
+        parser.error("exactly one of --source-pbf-file or --source-pbf-metadata-file is required")
+    if has_source_metadata and not args.import_pbf_file:
+        parser.error("--import-pbf-file is required when --source-pbf-metadata-file is used")
+    return args
 
 
 def ensure_dirs(output_dir: Path) -> tuple[Path, Path, Path]:
@@ -139,6 +148,46 @@ def build_source_file_metadata(
     return metadata
 
 
+def validate_source_file_metadata(raw: Any, label: str) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError(f"{label} metadata must be a JSON object")
+
+    path = raw.get("path")
+    filename = raw.get("filename")
+    size_bytes = raw.get("size_bytes")
+    modified_at = raw.get("modified_at")
+    sha256 = raw.get("sha256")
+
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"{label} metadata must include a non-empty path")
+    if not isinstance(filename, str) or not filename.strip():
+        raise ValueError(f"{label} metadata must include a non-empty filename")
+    if not isinstance(size_bytes, int) or size_bytes < 0:
+        raise ValueError(f"{label} metadata must include a non-negative integer size_bytes")
+    if not isinstance(modified_at, str) or not modified_at.strip():
+        raise ValueError(f"{label} metadata must include a non-empty modified_at")
+    if not isinstance(sha256, str) or not SHA256_RE.fullmatch(sha256):
+        raise ValueError(f"{label} metadata must include a lowercase 64-character sha256")
+
+    return {
+        "path": path,
+        "filename": filename,
+        "size_bytes": size_bytes,
+        "modified_at": modified_at,
+        "sha256": sha256,
+    }
+
+
+def load_source_file_metadata(path: Path, label: str) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"{label} metadata file not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} metadata file is not valid JSON: {path}") from exc
+    return validate_source_file_metadata(raw, label)
+
+
 def write_checksums(
     files: list[Path],
     output_path: Path,
@@ -231,14 +280,21 @@ def main() -> None:
     output_dir = Path(args.output_dir).resolve()
     state_dir = Path(args.state_dir).resolve() if args.state_dir else None
     csv_dir, gpx_dir, examples_dir = ensure_dirs(output_dir)
-    source_pbf_path = Path(args.source_pbf_file).resolve()
+    source_pbf_path = Path(args.source_pbf_file).resolve() if args.source_pbf_file else None
     import_pbf_path = Path(args.import_pbf_file).resolve() if args.import_pbf_file else source_pbf_path
     hash_cache: dict[tuple[str, int, int], str] = {}
 
+    if source_pbf_path is not None:
+        source_pbf_metadata = build_source_file_metadata(source_pbf_path, state_dir, hash_cache)
+    else:
+        source_pbf_metadata = load_source_file_metadata(Path(args.source_pbf_metadata_file).resolve(), "source_pbf")
+    assert import_pbf_path is not None
+    import_pbf_metadata = build_source_file_metadata(import_pbf_path, state_dir, hash_cache)
+
     source_lineage = {
         "source_url": args.source_url,
-        "source_pbf": build_source_file_metadata(source_pbf_path, state_dir, hash_cache),
-        "import_pbf": build_source_file_metadata(import_pbf_path, state_dir, hash_cache),
+        "source_pbf": source_pbf_metadata,
+        "import_pbf": import_pbf_metadata,
         "derivation": [
             "osm2pgsql flex import via schema/osm2pgsql/openinterstate.lua",
             "schema/derive.sql",
