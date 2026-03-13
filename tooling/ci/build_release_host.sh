@@ -225,7 +225,7 @@ PGPASSWORD="$DB_PASSWORD" osm2pgsql \
   --database="$DB_NAME" \
   --host="$DB_HOST" \
   --port="$DB_PORT" \
-  --username="$DB_USER" \
+  -U "$DB_USER" \
   --cache="$IMPORT_CACHE_MB" \
   "$FILTERED_PBF_FILE"
 
