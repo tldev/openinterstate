@@ -12,6 +12,8 @@ const INTERVAL_S: f64 = 5.0;
 const STEP_M: f64 = SPEED_MPS * INTERVAL_S;
 const LANE_OFFSET_M: f64 = 3.5;
 const ANCHOR_STEP_POINTS: usize = 40;
+const DISCONNECTED_MICRO_SEGMENT_MAX_LENGTH_M: f64 = 2_000.0;
+const DISCONNECTED_MICRO_SEGMENT_MAX_SHARE: f64 = 0.05;
 
 #[derive(Debug, Clone)]
 struct CorridorEdge {
@@ -26,6 +28,12 @@ struct CorridorInfo {
     corridor_id: i32,
     highway: String,
     canonical_direction: String,
+}
+
+#[derive(Debug, Clone)]
+struct CorridorSegment {
+    points: Vec<[f64; 2]>,
+    length_m: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -238,8 +246,18 @@ fn build_corridor_routes(
 
         let direction_code = canonical_to_direction_code(&corridor.canonical_direction);
 
-        let segments = walk_corridor_segments(edges, direction_code);
+        let segments = prune_micro_segments(walk_corridor_segments(edges, direction_code));
         if segments.is_empty() {
+            continue;
+        }
+        if segments.len() != 1 {
+            tracing::info!(
+                "Skipping disconnected reference route {} {} (corridor {}) with {} segments",
+                corridor.highway,
+                direction_code,
+                corridor.corridor_id,
+                segments.len()
+            );
             continue;
         }
 
@@ -247,7 +265,8 @@ fn build_corridor_routes(
         // This avoids interpolating across geographic gaps between disconnected
         // corridor components (which would create points over water/land).
         let mut waypoints: Vec<[f64; 2]> = Vec::new();
-        for mut seg in segments {
+        for segment in segments {
+            let mut seg = segment.points;
             if seg.len() < 2 {
                 continue;
             }
@@ -329,7 +348,7 @@ fn build_corridor_routes(
 ///
 /// Returns one polyline per connected component, sorted along the travel
 /// axis. Each segment is independently valid — no interpolation across gaps.
-fn walk_corridor_segments(edges: &[CorridorEdge], direction_code: &str) -> Vec<Vec<[f64; 2]>> {
+fn walk_corridor_segments(edges: &[CorridorEdge], direction_code: &str) -> Vec<CorridorSegment> {
     if edges.is_empty() {
         return Vec::new();
     }
@@ -370,7 +389,7 @@ fn walk_corridor_segments(edges: &[CorridorEdge], direction_code: &str) -> Vec<V
         }
     };
 
-    let mut component_polylines: Vec<(f64, Vec<[f64; 2]>)> = Vec::new();
+    let mut component_polylines: Vec<(f64, CorridorSegment)> = Vec::new();
 
     for comp_edges in &components {
         if comp_edges.is_empty() {
@@ -444,6 +463,7 @@ fn walk_corridor_segments(edges: &[CorridorEdge], direction_code: &str) -> Vec<V
 
         // Assemble polyline from edge geometries
         let comp_edge_list: Vec<&CorridorEdge> = comp_edges.iter().map(|&i| &edges[i]).collect();
+        let component_length_m: f64 = comp_edge_list.iter().map(|edge| edge.length_m).sum();
         let mut points: Vec<[f64; 2]> = Vec::new();
         for &(from, to, local_idx) in &steps {
             let edge = comp_edge_list[local_idx];
@@ -463,7 +483,13 @@ fn walk_corridor_segments(edges: &[CorridorEdge], direction_code: &str) -> Vec<V
 
         if points.len() >= 2 {
             let sort_key = projection(&points[0]).min(projection(points.last().unwrap()));
-            component_polylines.push((sort_key, points));
+            component_polylines.push((
+                sort_key,
+                CorridorSegment {
+                    points,
+                    length_m: component_length_m,
+                },
+            ));
         }
     }
 
@@ -485,8 +511,30 @@ fn walk_corridor_segments(edges: &[CorridorEdge], direction_code: &str) -> Vec<V
     // Return each component as a separate segment (no cross-gap interpolation)
     component_polylines
         .into_iter()
-        .map(|(_, poly)| poly)
-        .filter(|p| p.len() >= 2)
+        .map(|(_, segment)| segment)
+        .filter(|segment| segment.points.len() >= 2)
+        .collect()
+}
+
+fn prune_micro_segments(segments: Vec<CorridorSegment>) -> Vec<CorridorSegment> {
+    if segments.len() <= 1 {
+        return segments;
+    }
+
+    let longest_segment_m = segments
+        .iter()
+        .map(|segment| segment.length_m)
+        .fold(0.0_f64, f64::max);
+    if longest_segment_m <= 0.0 {
+        return segments;
+    }
+
+    segments
+        .into_iter()
+        .filter(|segment| {
+            segment.length_m >= DISCONNECTED_MICRO_SEGMENT_MAX_LENGTH_M
+                || segment.length_m >= longest_segment_m * DISCONNECTED_MICRO_SEGMENT_MAX_SHARE
+        })
         .collect()
 }
 
@@ -886,7 +934,7 @@ mod tests {
         ];
         let segments = walk_corridor_segments(&edges, "NB");
         assert_eq!(segments.len(), 1);
-        let poly = &segments[0];
+        let poly = &segments[0].points;
         assert_eq!(poly.len(), 3);
         assert_eq!(poly[0], [30.0, -87.0]);
         assert_eq!(poly[2], [31.0, -87.0]);
@@ -925,9 +973,74 @@ mod tests {
         // NB axis extremes: min lat 30.0 (node 1) → max lat 31.5 (node 5)
         let segments = walk_corridor_segments(&edges, "NB");
         assert_eq!(segments.len(), 1);
-        let poly = &segments[0];
+        let poly = &segments[0].points;
         assert_eq!(poly.first().unwrap()[0], 30.0);
         assert_eq!(poly.last().unwrap()[0], 31.5);
+    }
+
+    #[test]
+    fn prune_micro_segments_drops_tiny_detached_component() {
+        let segments = vec![
+            CorridorSegment {
+                points: vec![[32.0, -117.0], [49.0, -122.0]],
+                length_m: 2_200_000.0,
+            },
+            CorridorSegment {
+                points: vec![[32.54, -117.03], [32.543, -117.031]],
+                length_m: 641.0,
+            },
+        ];
+
+        let kept = prune_micro_segments(segments);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].length_m, 2_200_000.0);
+    }
+
+    #[test]
+    fn prune_micro_segments_keeps_legitimate_disjoint_mainlines() {
+        let segments = vec![
+            CorridorSegment {
+                points: vec![[41.0, -122.0], [44.0, -119.0]],
+                length_m: 372_000.0,
+            },
+            CorridorSegment {
+                points: vec![[44.0, -119.0], [46.0, -111.0]],
+                length_m: 1_237_000.0,
+            },
+        ];
+
+        let kept = prune_micro_segments(segments);
+
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn build_corridor_routes_skips_disconnected_routes() {
+        let corridors = vec![CorridorInfo {
+            corridor_id: 1,
+            highway: "I-84".to_string(),
+            canonical_direction: "east".to_string(),
+        }];
+        let edges = vec![
+            CorridorEdge {
+                start_node: 1,
+                end_node: 2,
+                polyline: vec![[41.0, -122.0], [42.0, -121.0]],
+                length_m: 120_000.0,
+            },
+            CorridorEdge {
+                start_node: 3,
+                end_node: 4,
+                polyline: vec![[45.0, -75.0], [46.0, -74.0]],
+                length_m: 120_000.0,
+            },
+        ];
+        let edges_by_corridor = HashMap::from([(1, edges)]);
+
+        let routes = build_corridor_routes(&corridors, &edges_by_corridor).unwrap();
+
+        assert!(routes.is_empty());
     }
 
     #[test]
