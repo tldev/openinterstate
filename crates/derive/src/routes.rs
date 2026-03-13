@@ -88,33 +88,39 @@ pub async fn build_reference_routes(pool: &PgPool) -> anyhow::Result<()> {
         .collect();
 
     // Load edges for all interstate corridors
-    let edge_rows: Vec<(i32, i64, i64, i32, String)> = sqlx::query_as(
-        "SELECT corridor_id, start_node, end_node, length_m, polyline_json \
-         FROM highway_edges \
-         WHERE corridor_id IS NOT NULL AND highway LIKE 'I-%'",
+    let edge_rows: Vec<(i32, String, String, i64, i64, i32, String)> = sqlx::query_as(
+        "SELECT c.corridor_id, c.highway, he.highway, he.start_node, he.end_node, he.length_m, he.polyline_json \
+         FROM corridors c \
+         JOIN highway_edges he ON he.corridor_id = c.corridor_id \
+         WHERE c.highway LIKE 'I-%'",
     )
     .fetch_all(pool)
     .await?;
 
     let mut edges_by_corridor: HashMap<i32, Vec<CorridorEdge>> = HashMap::new();
-    for (corridor_id, start_node, end_node, length_m, polyline_json) in edge_rows {
-        let polyline = parse_polyline_json(&polyline_json);
-        if polyline.len() < 2 {
-            continue;
+    for (
+        corridor_id,
+        corridor_highway,
+        edge_highway,
+        start_node,
+        end_node,
+        length_m,
+        polyline_json,
+    ) in edge_rows
+    {
+        if let Some(edge) = corridor_edge_from_row(
+            &corridor_highway,
+            &edge_highway,
+            start_node,
+            end_node,
+            length_m,
+            &polyline_json,
+        ) {
+            edges_by_corridor.entry(corridor_id).or_default().push(edge);
         }
-        edges_by_corridor
-            .entry(corridor_id)
-            .or_default()
-            .push(CorridorEdge {
-                start_node,
-                end_node,
-                polyline,
-                length_m: length_m as f64,
-            });
     }
 
     let mut routes = build_corridor_routes(&corridors, &edges_by_corridor)?;
-    collapse_same_highway_corridors(&mut routes)?;
 
     // Assign variant ranks
     let mut rank_map: HashMap<(String, String), i32> = HashMap::new();
@@ -465,8 +471,16 @@ fn walk_corridor_segments(edges: &[CorridorEdge], direction_code: &str) -> Vec<V
         return Vec::new();
     }
 
-    // Sort components along the travel axis
-    component_polylines.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    // Sort components along the travel axis in travel order so disconnected
+    // southbound and westbound routes do not jump backward before continuing.
+    let descending = matches!(direction_code, "WB" | "SB");
+    component_polylines.sort_by(|a, b| {
+        if descending {
+            b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
+        } else {
+            a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal)
+        }
+    });
 
     // Return each component as a separate segment (no cross-gap interpolation)
     component_polylines
@@ -557,119 +571,6 @@ fn bfs_shortest_path(
     None
 }
 
-/// Merge corridors for the same (highway, direction_code) into a single route.
-///
-/// Geographically disconnected interstates (I-76 PA vs CO) will have separate
-/// corridors. We merge them by sorting along the travel axis and concatenating.
-fn collapse_same_highway_corridors(routes: &mut Vec<RouteRow>) -> anyhow::Result<()> {
-    let mut grouped: HashMap<(String, String), Vec<RouteRow>> = HashMap::new();
-    for route in std::mem::take(routes) {
-        grouped
-            .entry((route.highway.clone(), route.direction_code.clone()))
-            .or_default()
-            .push(route);
-    }
-
-    let mut collapsed: Vec<RouteRow> = Vec::new();
-    for ((highway, direction_code), mut group) in grouped {
-        if group.len() == 1 {
-            collapsed.push(group.remove(0));
-            continue;
-        }
-
-        // Sort corridors by geographic position along the travel axis
-        let descending = matches!(direction_code.as_str(), "WB" | "SB");
-        group.sort_by(|a, b| {
-            let a_key = axis_sort_key(&direction_code, a);
-            let b_key = axis_sort_key(&direction_code, b);
-            if descending {
-                b_key.partial_cmp(&a_key).unwrap_or(Ordering::Equal)
-            } else {
-                a_key.partial_cmp(&b_key).unwrap_or(Ordering::Equal)
-            }
-        });
-
-        let mut merged_waypoints: Vec<[f64; 2]> = Vec::new();
-        for route in &group {
-            if route.waypoints.is_empty() {
-                continue;
-            }
-            if merged_waypoints.is_empty() {
-                merged_waypoints.extend(route.waypoints.iter().copied());
-                continue;
-            }
-            // Skip first point if very close to last merged point (avoid duplicate)
-            let append_from = match (
-                merged_waypoints.last().copied(),
-                route.waypoints.first().copied(),
-            ) {
-                (Some(last), Some(first)) => {
-                    if haversine_distance(last[0], last[1], first[0], first[1]) < 35.0 {
-                        1
-                    } else {
-                        0
-                    }
-                }
-                _ => 0,
-            };
-            merged_waypoints.extend(route.waypoints.iter().skip(append_from).copied());
-        }
-
-        if merged_waypoints.len() < 2 {
-            continue;
-        }
-
-        let distance_m = *cumulative_distances(&merged_waypoints)
-            .last()
-            .unwrap_or(&0.0);
-        if distance_m < 1.0 {
-            continue;
-        }
-
-        let bounds = bounds_for_points(&merged_waypoints);
-        let start = merged_waypoints.first().copied().unwrap_or([0.0, 0.0]);
-        let end = merged_waypoints.last().copied().unwrap_or([0.0, 0.0]);
-        let waypoints_json = serde_json::to_string(&merged_waypoints)?;
-        let label = direction_label(&direction_code).to_string();
-
-        collapsed.push(RouteRow {
-            id: deterministic_route_id(&highway, &direction_code, 0, &waypoints_json).to_string(),
-            highway: highway.clone(),
-            direction_code: direction_code.clone(),
-            direction_label: label.clone(),
-            display_name: format!("{} {}", highway, label),
-            corridor_id: 0,
-            variant_rank: 0,
-            distance_m,
-            duration_s: merged_waypoints.len() as f64 * INTERVAL_S,
-            interval_s: INTERVAL_S,
-            point_count: merged_waypoints.len() as i32,
-            start_lat: start[0],
-            start_lon: start[1],
-            end_lat: end[0],
-            end_lon: end[1],
-            min_lat: bounds.0,
-            max_lat: bounds.1,
-            min_lon: bounds.2,
-            max_lon: bounds.3,
-            waypoints_json,
-            waypoints: merged_waypoints,
-        });
-    }
-
-    collapsed.sort_by(|a, b| {
-        let num_a = interstate_number(&a.highway);
-        let num_b = interstate_number(&b.highway);
-        num_a
-            .cmp(&num_b)
-            .then_with(|| a.highway.cmp(&b.highway))
-            .then_with(|| a.direction_code.cmp(&b.direction_code))
-    });
-
-    *routes = collapsed;
-    Ok(())
-}
-
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -699,15 +600,6 @@ fn interstate_number(highway: &str) -> i32 {
         .strip_prefix("I-")
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(0)
-}
-
-fn axis_sort_key(direction_code: &str, route: &RouteRow) -> f64 {
-    match direction_code {
-        "WB" => route.start_lon.max(route.end_lon),
-        "EB" => route.start_lon.min(route.end_lon),
-        "SB" => route.start_lat.max(route.end_lat),
-        _ => route.start_lat.min(route.end_lat), // NB
-    }
 }
 
 /// Check whether the polyline's overall heading is consistent with the
@@ -742,6 +634,31 @@ fn parse_polyline_json(raw: &str) -> Vec<[f64; 2]> {
             }
         })
         .collect()
+}
+
+fn corridor_edge_from_row(
+    corridor_highway: &str,
+    edge_highway: &str,
+    start_node: i64,
+    end_node: i64,
+    length_m: i32,
+    polyline_json: &str,
+) -> Option<CorridorEdge> {
+    if corridor_highway != edge_highway {
+        return None;
+    }
+
+    let polyline = parse_polyline_json(polyline_json);
+    if polyline.len() < 2 {
+        return None;
+    }
+
+    Some(CorridorEdge {
+        start_node,
+        end_node,
+        polyline,
+        length_m: length_m as f64,
+    })
 }
 
 fn cumulative_distances(points: &[[f64; 2]]) -> Vec<f64> {
@@ -1011,5 +928,15 @@ mod tests {
         let poly = &segments[0];
         assert_eq!(poly.first().unwrap()[0], 30.0);
         assert_eq!(poly.last().unwrap()[0], 31.5);
+    }
+
+    #[test]
+    fn corridor_edge_loader_skips_mismatched_highways() {
+        let edge =
+            corridor_edge_from_row("I-8", "I-795", 1, 2, 100, "[[32.0,-117.0],[32.1,-117.1]]");
+        assert!(edge.is_none());
+
+        let edge = corridor_edge_from_row("I-8", "I-8", 1, 2, 100, "[[32.0,-117.0],[32.1,-117.1]]");
+        assert!(edge.is_some());
     }
 }

@@ -1060,108 +1060,112 @@ fn build_highway_corridors(
         });
     }
 
-    // 7. Absorb minor corridors into same-direction primary corridors.
-    //    A corridor is "minor" if it has 0 exits OR has <5% of the exits
-    //    of the largest same-direction corridor. These are interchange stubs,
-    //    short carriageway fragments from the directional split, etc.
-    if results.len() > 2 {
-        // Find the largest corridor per direction by edge count
-        let mut max_edges_by_dir: HashMap<Option<String>, usize> = HashMap::new();
-        for c in &results {
-            let entry = max_edges_by_dir
-                .entry(c.canonical_direction.clone())
-                .or_default();
-            *entry = (*entry).max(c.member_edge_ids.len());
-        }
-
-        let mut orphan_edges_by_dir: HashMap<Option<String>, Vec<String>> = HashMap::new();
-        let mut orphan_exits_by_dir: HashMap<Option<String>, Vec<CorridorExitResult>> =
-            HashMap::new();
-        let mut keep = Vec::new();
-        let mut absorbed_count = 0usize;
-
-        for c in results.into_iter() {
-            let primary_edges = max_edges_by_dir
-                .get(&c.canonical_direction)
-                .copied()
-                .unwrap_or(0);
-            // A corridor is minor if it has <10% of the edges of the largest
-            // same-direction corridor, OR if it has very few exits relative
-            // to its edges.
-            let is_edge_minor = c.member_edge_ids.len() * 10 < primary_edges;
-            let is_exit_minor = c.exits.len() <= 5 && primary_edges > c.member_edge_ids.len();
-            let is_minor = is_edge_minor || is_exit_minor;
-            if is_minor {
-                absorbed_count += 1;
-                *next_id -= 1;
-                orphan_edges_by_dir
-                    .entry(c.canonical_direction.clone())
-                    .or_default()
-                    .extend(c.member_edge_ids);
-                orphan_exits_by_dir
-                    .entry(c.canonical_direction.clone())
-                    .or_default()
-                    .extend(c.exits);
-            } else {
-                keep.push(c);
-            }
-        }
-        results = keep;
-
-        if absorbed_count > 0 {
-            tracing::info!(
-                "  {}: absorbing {} minor corridors into same-direction primaries",
-                highway,
-                absorbed_count
-            );
-            for (dir, edges) in orphan_edges_by_dir {
-                let exits = orphan_exits_by_dir.remove(&dir).unwrap_or_default();
-                let target = results
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| t.canonical_direction == dir)
-                    .max_by_key(|(_, t)| t.member_edge_ids.len())
-                    .map(|(j, _)| j)
-                    .or_else(|| {
-                        results
-                            .iter()
-                            .enumerate()
-                            .max_by_key(|(_, t)| t.member_edge_ids.len())
-                            .map(|(j, _)| j)
-                    });
-                if let Some(ti) = target {
-                    results[ti].member_edge_ids.extend(edges);
-                    // Binary-insert each absorbed exit into the already-sorted
-                    // list at the correct projection position.
-                    let (dlat, dlon) = results[ti].displacement;
-                    let has_disp = dlat.abs() > 1e-6 || dlon.abs() > 1e-6;
-                    for exit in exits {
-                        let proj = if has_disp {
-                            exit.lat * dlat + exit.lon * dlon
-                        } else {
-                            exit.lat
-                        };
-                        let pos = results[ti].exits.partition_point(|e| {
-                            let ep = if has_disp {
-                                e.lat * dlat + e.lon * dlon
-                            } else {
-                                e.lat
-                            };
-                            ep < proj
-                        });
-                        results[ti].exits.insert(pos, exit);
-                    }
-                }
-            }
-        }
-    }
-
-    results
+    absorb_minor_corridors(highway, results)
 }
 
 // ============================================================================
 // Proximity merging
 // ============================================================================
+
+fn absorb_minor_corridors(highway: &str, results: Vec<CorridorResult>) -> Vec<CorridorResult> {
+    // Keep corridor ids sparse after absorption. Reusing ids here can make a
+    // later highway overwrite an earlier corridor row and mix their edge sets.
+    if results.len() <= 2 {
+        return results;
+    }
+
+    let mut max_edges_by_dir: HashMap<Option<String>, usize> = HashMap::new();
+    for corridor in &results {
+        let entry = max_edges_by_dir
+            .entry(corridor.canonical_direction.clone())
+            .or_default();
+        *entry = (*entry).max(corridor.member_edge_ids.len());
+    }
+
+    let mut orphan_edges_by_dir: HashMap<Option<String>, Vec<String>> = HashMap::new();
+    let mut orphan_exits_by_dir: HashMap<Option<String>, Vec<CorridorExitResult>> = HashMap::new();
+    let mut keep = Vec::new();
+    let mut absorbed_count = 0usize;
+
+    for corridor in results {
+        let primary_edges = max_edges_by_dir
+            .get(&corridor.canonical_direction)
+            .copied()
+            .unwrap_or(0);
+        // A corridor is minor if it has <10% of the edges of the largest
+        // same-direction corridor, OR if it has very few exits relative to
+        // its edge count.
+        let is_edge_minor = corridor.member_edge_ids.len() * 10 < primary_edges;
+        let is_exit_minor =
+            corridor.exits.len() <= 5 && primary_edges > corridor.member_edge_ids.len();
+        let is_minor = is_edge_minor || is_exit_minor;
+        if is_minor {
+            absorbed_count += 1;
+            orphan_edges_by_dir
+                .entry(corridor.canonical_direction.clone())
+                .or_default()
+                .extend(corridor.member_edge_ids);
+            orphan_exits_by_dir
+                .entry(corridor.canonical_direction.clone())
+                .or_default()
+                .extend(corridor.exits);
+        } else {
+            keep.push(corridor);
+        }
+    }
+
+    if absorbed_count == 0 {
+        return keep;
+    }
+
+    tracing::info!(
+        "  {}: absorbing {} minor corridors into same-direction primaries",
+        highway,
+        absorbed_count
+    );
+
+    for (dir, edges) in orphan_edges_by_dir {
+        let exits = orphan_exits_by_dir.remove(&dir).unwrap_or_default();
+        let target = keep
+            .iter()
+            .enumerate()
+            .filter(|(_, corridor)| corridor.canonical_direction == dir)
+            .max_by_key(|(_, corridor)| corridor.member_edge_ids.len())
+            .map(|(idx, _)| idx)
+            .or_else(|| {
+                keep.iter()
+                    .enumerate()
+                    .max_by_key(|(_, corridor)| corridor.member_edge_ids.len())
+                    .map(|(idx, _)| idx)
+            });
+
+        if let Some(target_idx) = target {
+            keep[target_idx].member_edge_ids.extend(edges);
+            // Binary-insert each absorbed exit into the already-sorted list at
+            // the correct projection position.
+            let (dlat, dlon) = keep[target_idx].displacement;
+            let has_disp = dlat.abs() > 1e-6 || dlon.abs() > 1e-6;
+            for exit in exits {
+                let proj = if has_disp {
+                    exit.lat * dlat + exit.lon * dlon
+                } else {
+                    exit.lat
+                };
+                let pos = keep[target_idx].exits.partition_point(|existing| {
+                    let existing_proj = if has_disp {
+                        existing.lat * dlat + existing.lon * dlon
+                    } else {
+                        existing.lat
+                    };
+                    existing_proj < proj
+                });
+                keep[target_idx].exits.insert(pos, exit);
+            }
+        }
+    }
+
+    keep
+}
 
 fn merge_components_by_proximity(
     edges_by_comp: &HashMap<i32, Vec<&EdgeData>>,
@@ -1683,4 +1687,57 @@ async fn write_corridors(
         corridor_exits_created,
         edges_updated,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{absorb_minor_corridors, CorridorExitResult, CorridorResult};
+
+    fn corridor(
+        corridor_id: i32,
+        direction: &str,
+        edge_count: usize,
+        exit_count: usize,
+    ) -> CorridorResult {
+        CorridorResult {
+            corridor_id,
+            highway: "I-TEST".to_string(),
+            canonical_direction: Some(direction.to_string()),
+            exits: (0..exit_count)
+                .map(|idx| CorridorExitResult {
+                    exit_id: format!("exit-{corridor_id}-{idx}"),
+                    ref_val: None,
+                    name: None,
+                    lat: idx as f64,
+                    lon: idx as f64,
+                })
+                .collect(),
+            member_edge_ids: (0..edge_count)
+                .map(|idx| format!("edge-{corridor_id}-{idx}"))
+                .collect(),
+            displacement: (1.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn absorbed_corridors_do_not_force_dense_id_reuse() {
+        let kept = absorb_minor_corridors(
+            "I-TEST",
+            vec![
+                corridor(10, "north", 100, 20),
+                corridor(11, "north", 2, 1),
+                corridor(12, "north", 90, 18),
+            ],
+        );
+
+        let ids: Vec<i32> = kept.iter().map(|corridor| corridor.corridor_id).collect();
+        assert_eq!(ids, vec![10, 12]);
+        assert!(kept.iter().any(|corridor| {
+            corridor.corridor_id == 10
+                && corridor
+                    .member_edge_ids
+                    .iter()
+                    .any(|edge_id| edge_id == "edge-11-0")
+        }));
+    }
 }
