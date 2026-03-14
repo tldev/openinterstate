@@ -11,6 +11,7 @@ Usage:
     --release-id release-YYYY-MM-DD \
     --filtered-pbf-file /abs/path/us-latest.canonical-filtered.osm.pbf \
     --source-pbf-metadata-file /abs/path/source-pbf-metadata.json \
+    --interstate-relation-cache-file /abs/path/interstate-relations.tsv \
     --output-root /abs/path/release-output \
     --work-dir /abs/path/workdir \
     [--source-url URL]
@@ -68,6 +69,7 @@ wait_for_postgres() {
 RELEASE_ID=""
 FILTERED_PBF_FILE=""
 SOURCE_PBF_METADATA_FILE=""
+INTERSTATE_RELATION_CACHE_FILE=""
 SOURCE_URL=""
 OUTPUT_ROOT=""
 WORK_DIR=""
@@ -94,6 +96,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --source-pbf-metadata-file)
       SOURCE_PBF_METADATA_FILE="$2"
+      shift 2
+      ;;
+    --interstate-relation-cache-file)
+      INTERSTATE_RELATION_CACHE_FILE="$2"
       shift 2
       ;;
     --source-url)
@@ -131,6 +137,9 @@ done
 
 [[ -f "$FILTERED_PBF_FILE" ]] || die "filtered PBF not found: $FILTERED_PBF_FILE"
 [[ -f "$SOURCE_PBF_METADATA_FILE" ]] || die "source metadata not found: $SOURCE_PBF_METADATA_FILE"
+if [[ -n "$INTERSTATE_RELATION_CACHE_FILE" ]]; then
+  [[ -f "$INTERSTATE_RELATION_CACHE_FILE" ]] || die "interstate relation cache not found: $INTERSTATE_RELATION_CACHE_FILE"
+fi
 
 STATE_DIR="${STATE_DIR:-$WORK_DIR/state}"
 DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
@@ -239,9 +248,22 @@ PGPASSWORD="$DB_PASSWORD" psql \
   -f "$REPO_ROOT/schema/derive.sql"
 
 log "Building graph, corridors, and reference routes"
-cargo run --locked --release -p openinterstate-derive -- \
-  --database-url "$DATABASE_URL" \
-  all
+DERIVE_ARGS=(
+  cargo
+  run
+  --locked
+  --release
+  -p
+  openinterstate-derive
+  --
+  --database-url
+  "$DATABASE_URL"
+)
+if [[ -n "$INTERSTATE_RELATION_CACHE_FILE" ]]; then
+  DERIVE_ARGS+=(--interstate-relation-cache "$INTERSTATE_RELATION_CACHE_FILE")
+fi
+DERIVE_ARGS+=(all)
+"${DERIVE_ARGS[@]}"
 
 log "Exporting release artifacts"
 EXPORT_ARGS=(
