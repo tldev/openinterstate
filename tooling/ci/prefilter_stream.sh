@@ -90,7 +90,10 @@ source "$REPO_ROOT/bin/lib.sh"
 log "Free space before streamed prefilter"
 df -h "$(dirname "$OUTPUT_PBF")" >&2
 
-mapfile -t FILTER_ARGS < <(oi_canonical_filter_args)
+FILTER_ARGS=()
+while IFS= read -r line; do
+  FILTER_ARGS+=("$line")
+done < <(oi_canonical_filter_args)
 RAW_PBF="$(mktemp "${TMPDIR:-/tmp}/openinterstate-source-XXXXXX.osm.pbf")"
 
 log "Downloading raw source PBF to ephemeral runner storage"

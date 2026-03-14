@@ -19,9 +19,9 @@ struct Cli {
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
 
-    /// Optional cached Interstate route relation membership file.
+    /// Cached Interstate route relation membership file.
     #[arg(long, env = "INTERSTATE_RELATION_CACHE")]
-    interstate_relation_cache: Option<PathBuf>,
+    interstate_relation_cache: PathBuf,
 
     #[command(subcommand)]
     command: Command,
@@ -64,10 +64,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     tracing::info!("Connected to database");
 
     match command {
-        Command::All => run_all(&pool, interstate_relation_cache.as_deref()).await,
-        Command::Graph => run_graph(&pool, interstate_relation_cache.as_deref()).await,
-        Command::Corridors => run_corridors(&pool, interstate_relation_cache.as_deref()).await,
-        Command::Routes => run_routes(&pool, interstate_relation_cache.as_deref()).await,
+        Command::All => run_all(&pool, &interstate_relation_cache).await,
+        Command::Graph => run_graph(&pool, &interstate_relation_cache).await,
+        Command::Corridors => run_corridors(&pool, &interstate_relation_cache).await,
+        Command::Routes => run_routes(&pool, &interstate_relation_cache).await,
     }
 }
 
@@ -78,23 +78,20 @@ async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
         .await?)
 }
 
-async fn run_all(pool: &PgPool, interstate_relation_cache: Option<&Path>) -> anyhow::Result<()> {
+async fn run_all(pool: &PgPool, interstate_relation_cache: &Path) -> anyhow::Result<()> {
     run_graph(pool, interstate_relation_cache).await?;
     run_corridors(pool, interstate_relation_cache).await?;
     run_routes(pool, interstate_relation_cache).await
 }
 
-async fn run_graph(pool: &PgPool, interstate_relation_cache: Option<&Path>) -> anyhow::Result<()> {
+async fn run_graph(pool: &PgPool, interstate_relation_cache: &Path) -> anyhow::Result<()> {
     tracing::info!("Building highway graph from canonical osm2pgsql tables");
     let edge_count = graph::build_graph(pool, interstate_relation_cache).await?;
     tracing::info!("Graph build complete: {} edges", edge_count);
     Ok(())
 }
 
-async fn run_corridors(
-    pool: &PgPool,
-    interstate_relation_cache: Option<&Path>,
-) -> anyhow::Result<()> {
+async fn run_corridors(pool: &PgPool, interstate_relation_cache: &Path) -> anyhow::Result<()> {
     tracing::info!("Building Interstate corridors");
     let stats = graph::relation_corridors::build_corridors(pool, interstate_relation_cache).await?;
     tracing::info!(
@@ -106,7 +103,7 @@ async fn run_corridors(
     Ok(())
 }
 
-async fn run_routes(pool: &PgPool, interstate_relation_cache: Option<&Path>) -> anyhow::Result<()> {
+async fn run_routes(pool: &PgPool, interstate_relation_cache: &Path) -> anyhow::Result<()> {
     tracing::info!("Building reference routes from corridors");
     routes::build_reference_routes(pool, interstate_relation_cache).await?;
     tracing::info!("Reference route build complete");
@@ -121,8 +118,13 @@ mod tests {
 
     #[test]
     fn requires_a_subcommand() {
-        let parse =
-            Cli::try_parse_from(["openinterstate-derive", "--database-url", "postgres://db"]);
+        let parse = Cli::try_parse_from([
+            "openinterstate-derive",
+            "--database-url",
+            "postgres://db",
+            "--interstate-relation-cache",
+            "/tmp/cache.tsv",
+        ]);
         assert!(parse.is_err(), "a derive step should be required");
     }
 
@@ -132,6 +134,8 @@ mod tests {
             "openinterstate-derive",
             "--database-url",
             "postgres://db",
+            "--interstate-relation-cache",
+            "/tmp/cache.tsv",
             "all",
         ])
         .expect("parse all subcommand");
@@ -144,6 +148,8 @@ mod tests {
             "openinterstate-derive",
             "--database-url",
             "postgres://db",
+            "--interstate-relation-cache",
+            "/tmp/cache.tsv",
             "corridors",
         ])
         .expect("parse corridors subcommand");

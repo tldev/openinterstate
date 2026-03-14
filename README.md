@@ -81,7 +81,7 @@ every iteration.
 - `compose.yaml`: Docker services for PostGIS and the build runner
 - `docker/runner/`: tool image with Rust, osm2pgsql, osmium, and Python
 - `schema/`: bootstrap SQL, derive SQL, and the osm2pgsql flex mapping
-- `tooling/`: release export and repo validation scripts
+- `tooling/`: release export and CI release scripts
 - `crates/core/`: shared Rust geometry and highway helpers
 - `crates/derive/`: Rust builders for graph, corridors, and reference routes
 - `docs/`: project scope, contract, roadmap, and release docs

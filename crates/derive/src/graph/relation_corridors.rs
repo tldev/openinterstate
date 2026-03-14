@@ -3,15 +3,13 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 
 use openinterstate_core::geo::haversine_distance;
-use openinterstate_core::highway_ref::{is_interstate_highway_ref, normalize_highway_ref};
+use openinterstate_core::highway_ref::normalize_highway_ref;
 use sqlx::PgPool;
 
 use crate::interstate_relations::{
     group_relation_members, load_interstate_relation_members, normalize_direction,
     InterstateRouteGroup,
 };
-
-use super::corridors::BuildCorridorsStats;
 
 const CONNECTOR_HIGHWAY_TYPES: &[&str] = &[
     "motorway",
@@ -30,6 +28,12 @@ const MIN_ROUTE_LENGTH_M: f64 = 50_000.0;
 const SHORT_FALLBACK_CONNECTOR_MAX_COST_M: u64 = 10_000;
 const DISCONNECTED_MICRO_SEGMENT_MAX_LENGTH_M: f64 = 2_000.0;
 const DISCONNECTED_MICRO_SEGMENT_MAX_SHARE: f64 = 0.05;
+
+pub struct BuildCorridorsStats {
+    pub corridors_created: usize,
+    pub corridor_exits_created: usize,
+    pub edges_updated: usize,
+}
 
 type HighwayRow = (
     i64,            // way_id
@@ -53,8 +57,6 @@ struct RouteWay {
 #[derive(Debug, Clone)]
 struct ConnectorGraph {
     adjacency: HashMap<i64, Vec<ConnectorArc>>,
-    node_coords: HashMap<i64, [f64; 2]>,
-    arc_coords: HashMap<(i64, i64), Vec<[f64; 2]>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,55 +128,17 @@ struct CorridorExitDraft {
     sort_key_m: f64,
 }
 
-#[derive(Debug, Default, Clone)]
-struct RouteAssembly {
-    segments: Vec<Vec<[f64; 2]>>,
-    source_way_ids: BTreeSet<i64>,
-}
-
-#[derive(Debug, Clone)]
-struct OrientedWay {
-    way_id: i64,
-    nodes: Vec<i64>,
-    geometry: Vec<[f64; 2]>,
-    preference_penalty: u8,
-}
-
-#[derive(Debug, Clone)]
-struct MemberAttachment {
-    points: Vec<[f64; 2]>,
-    tail_node: i64,
-    source_way_ids: Vec<i64>,
-    cost_m: u64,
-    preference_penalty: u8,
-}
-
-#[derive(Debug, Clone)]
-struct ConnectorPath {
-    target_node: i64,
-    points: Vec<[f64; 2]>,
-    way_ids: Vec<i64>,
-    cost_m: u64,
-}
-
 pub async fn build_corridors(
     pool: &PgPool,
-    interstate_relation_cache: Option<&Path>,
+    interstate_relation_cache: &Path,
 ) -> Result<BuildCorridorsStats, anyhow::Error> {
-    let Some(cache_path) = interstate_relation_cache else {
-        tracing::warn!(
-            "No Interstate relation cache provided; falling back to legacy corridor builder"
-        );
-        return super::corridors::build_corridors(pool).await;
-    };
-
-    let relation_members = load_interstate_relation_members(cache_path)?;
+    let relation_members = load_interstate_relation_members(interstate_relation_cache)?;
     let route_groups = filter_route_groups(group_relation_members(&relation_members));
     if route_groups.is_empty() {
-        tracing::warn!(
-            "No Interstate relation groups available; falling back to legacy corridor builder"
-        );
-        return super::corridors::build_corridors(pool).await;
+        return Err(anyhow::anyhow!(
+            "no Interstate relation groups found in relation cache {}",
+            interstate_relation_cache.display()
+        ));
     }
 
     tracing::info!(
@@ -468,267 +432,6 @@ fn build_corridor_draft(
     }))
 }
 
-fn assemble_relation_geometry(
-    group: &InterstateRouteGroup,
-    ways_by_id: &HashMap<i64, RouteWay>,
-    connector_graph: &ConnectorGraph,
-) -> RouteAssembly {
-    let mut assembly = RouteAssembly::default();
-    let mut current_segment = Vec::new();
-    let mut current_tail = None;
-    let canonical_direction = group.direction.as_deref().unwrap_or("north");
-
-    let ordered_members: Vec<_> = group
-        .members
-        .iter()
-        .filter(|member| ways_by_id.contains_key(&member.way_id))
-        .collect();
-
-    for (idx, member) in ordered_members.iter().enumerate() {
-        let next_member = ordered_members.get(idx + 1).copied();
-        let attachment = if let Some(tail_node) = current_tail {
-            choose_member_attachment(
-                tail_node,
-                member,
-                ways_by_id,
-                connector_graph,
-                canonical_direction,
-            )
-        } else {
-            choose_start_attachment(
-                member,
-                next_member,
-                ways_by_id,
-                connector_graph,
-                canonical_direction,
-            )
-        };
-
-        let Some((attachment, starts_new_segment)) = attachment else {
-            continue;
-        };
-
-        if starts_new_segment && current_segment.len() >= 2 {
-            assembly.segments.push(current_segment);
-            current_segment = Vec::new();
-        }
-
-        append_points_dedup(&mut current_segment, &attachment.points);
-        assembly
-            .source_way_ids
-            .extend(attachment.source_way_ids.into_iter());
-        current_tail = Some(attachment.tail_node);
-    }
-
-    if current_segment.len() >= 2 {
-        assembly.segments.push(current_segment);
-    }
-
-    assembly
-}
-
-fn choose_start_attachment(
-    member: &crate::interstate_relations::InterstateRelationMember,
-    next_member: Option<&crate::interstate_relations::InterstateRelationMember>,
-    ways_by_id: &HashMap<i64, RouteWay>,
-    connector_graph: &ConnectorGraph,
-    canonical_direction: &str,
-) -> Option<(MemberAttachment, bool)> {
-    let way = ways_by_id.get(&member.way_id)?;
-    let candidates = oriented_way_candidates(way, member.role.as_deref(), canonical_direction);
-
-    let best = candidates.into_iter().min_by(|a, b| {
-        let a_next_cost = next_member
-            .and_then(|next| {
-                estimate_transition_cost(
-                    a.tail_node(),
-                    next,
-                    ways_by_id,
-                    connector_graph,
-                    canonical_direction,
-                )
-            })
-            .unwrap_or(0);
-        let b_next_cost = next_member
-            .and_then(|next| {
-                estimate_transition_cost(
-                    b.tail_node(),
-                    next,
-                    ways_by_id,
-                    connector_graph,
-                    canonical_direction,
-                )
-            })
-            .unwrap_or(0);
-
-        a_next_cost
-            .cmp(&b_next_cost)
-            .then_with(|| a.preference_penalty.cmp(&b.preference_penalty))
-            .then_with(|| {
-                direction_match_rank(&a.geometry, canonical_direction)
-                    .cmp(&direction_match_rank(&b.geometry, canonical_direction))
-            })
-    })?;
-
-    Some((
-        MemberAttachment {
-            points: best.geometry.clone(),
-            tail_node: best.tail_node(),
-            source_way_ids: vec![best.way_id],
-            cost_m: 0,
-            preference_penalty: best.preference_penalty,
-        },
-        false,
-    ))
-}
-
-fn choose_member_attachment(
-    current_tail: i64,
-    member: &crate::interstate_relations::InterstateRelationMember,
-    ways_by_id: &HashMap<i64, RouteWay>,
-    connector_graph: &ConnectorGraph,
-    canonical_direction: &str,
-) -> Option<(MemberAttachment, bool)> {
-    let way = ways_by_id.get(&member.way_id)?;
-    let candidates = oriented_way_candidates(way, member.role.as_deref(), canonical_direction);
-    if candidates.is_empty() {
-        return None;
-    }
-
-    let best_connected = candidates
-        .iter()
-        .filter_map(|candidate| connect_candidate(current_tail, candidate, connector_graph))
-        .min_by(|a, b| {
-            a.cost_m
-                .cmp(&b.cost_m)
-                .then_with(|| a.preference_penalty.cmp(&b.preference_penalty))
-        });
-
-    if let Some(best) = best_connected {
-        return Some((best, false));
-    }
-
-    let best_standalone = candidates.into_iter().min_by(|a, b| {
-        a.preference_penalty
-            .cmp(&b.preference_penalty)
-            .then_with(|| {
-                direction_match_rank(&a.geometry, canonical_direction)
-                    .cmp(&direction_match_rank(&b.geometry, canonical_direction))
-            })
-    })?;
-
-    let tail_node = best_standalone.tail_node();
-    let way_id = best_standalone.way_id;
-    let preference_penalty = best_standalone.preference_penalty;
-    Some((
-        MemberAttachment {
-            points: best_standalone.geometry,
-            tail_node,
-            source_way_ids: vec![way_id],
-            cost_m: u64::MAX / 4,
-            preference_penalty,
-        },
-        true,
-    ))
-}
-
-fn estimate_transition_cost(
-    current_tail: i64,
-    member: &crate::interstate_relations::InterstateRelationMember,
-    ways_by_id: &HashMap<i64, RouteWay>,
-    connector_graph: &ConnectorGraph,
-    canonical_direction: &str,
-) -> Option<u64> {
-    let way = ways_by_id.get(&member.way_id)?;
-    oriented_way_candidates(way, member.role.as_deref(), canonical_direction)
-        .into_iter()
-        .filter_map(|candidate| {
-            if candidate.nodes.contains(&current_tail) {
-                return Some(0);
-            }
-            shortest_connector_path_to_nodes(current_tail, &candidate.nodes, connector_graph)
-                .map(|path| path.cost_m)
-        })
-        .min()
-}
-
-fn connect_candidate(
-    current_tail: i64,
-    candidate: &OrientedWay,
-    connector_graph: &ConnectorGraph,
-) -> Option<MemberAttachment> {
-    if let Some(entry_idx) = find_node_index(&candidate.nodes, current_tail) {
-        let points = candidate.geometry.get(entry_idx..)?.to_vec();
-        return Some(MemberAttachment {
-            points,
-            tail_node: candidate.tail_node(),
-            source_way_ids: vec![candidate.way_id],
-            cost_m: 0,
-            preference_penalty: candidate.preference_penalty,
-        });
-    }
-
-    let path = shortest_connector_path_to_nodes(current_tail, &candidate.nodes, connector_graph)?;
-    let entry_idx = find_node_index(&candidate.nodes, path.target_node)?;
-    let mut points = path.points;
-    points.extend(candidate.geometry.iter().skip(entry_idx).copied());
-    let mut source_way_ids = path.way_ids;
-    source_way_ids.push(candidate.way_id);
-
-    Some(MemberAttachment {
-        points,
-        tail_node: candidate.tail_node(),
-        source_way_ids,
-        cost_m: path.cost_m,
-        preference_penalty: candidate.preference_penalty,
-    })
-}
-
-fn oriented_way_candidates(
-    way: &RouteWay,
-    role: Option<&str>,
-    canonical_direction: &str,
-) -> Vec<OrientedWay> {
-    if way.nodes.len() < 2 || way.nodes.len() != way.geometry.len() {
-        return Vec::new();
-    }
-
-    let role_hint = member_role_hint(role);
-    let forward_geometry: Vec<[f64; 2]> =
-        way.geometry.iter().map(|&(lat, lon)| [lat, lon]).collect();
-    let mut candidates = vec![OrientedWay {
-        way_id: way.way_id,
-        nodes: way.nodes.clone(),
-        geometry: forward_geometry.clone(),
-        preference_penalty: orientation_preference_penalty(
-            &forward_geometry,
-            OrientationState::Forward,
-            role_hint,
-            canonical_direction,
-        ),
-    }];
-
-    if !way.is_oneway {
-        let mut reverse_nodes = way.nodes.clone();
-        reverse_nodes.reverse();
-        let mut reverse_geometry = forward_geometry;
-        reverse_geometry.reverse();
-        candidates.push(OrientedWay {
-            way_id: way.way_id,
-            nodes: reverse_nodes,
-            geometry: reverse_geometry.clone(),
-            preference_penalty: orientation_preference_penalty(
-                &reverse_geometry,
-                OrientationState::Reverse,
-                role_hint,
-                canonical_direction,
-            ),
-        });
-    }
-
-    candidates
-}
-
 fn append_points_dedup(segment: &mut Vec<[f64; 2]>, points: &[[f64; 2]]) {
     let skip_first = usize::from(
         !segment.is_empty()
@@ -738,26 +441,14 @@ fn append_points_dedup(segment: &mut Vec<[f64; 2]>, points: &[[f64; 2]]) {
     segment.extend(points.iter().skip(skip_first).copied());
 }
 
-fn find_node_index(nodes: &[i64], node_id: i64) -> Option<usize> {
-    nodes.iter().position(|&candidate| candidate == node_id)
-}
-
 fn build_connector_graph(ways: &[&RouteWay]) -> ConnectorGraph {
     let mut adjacency: HashMap<i64, Vec<ConnectorArc>> = HashMap::new();
-    let mut node_coords: HashMap<i64, [f64; 2]> = HashMap::new();
-    let mut arc_coords: HashMap<(i64, i64), Vec<[f64; 2]>> = HashMap::new();
     for way in ways {
         if !CONNECTOR_HIGHWAY_TYPES.contains(&way.highway_type.as_str()) {
             continue;
         }
         if way.nodes.len() < 2 || way.nodes.len() != way.geometry.len() {
             continue;
-        }
-
-        for (idx, &node_id) in way.nodes.iter().enumerate() {
-            node_coords
-                .entry(node_id)
-                .or_insert([way.geometry[idx].0, way.geometry[idx].1]);
         }
 
         for idx in 0..way.nodes.len() - 1 {
@@ -775,194 +466,17 @@ fn build_connector_graph(ways: &[&RouteWay]) -> ConnectorGraph {
                 weight_m,
                 way_id: way.way_id,
             });
-            arc_coords
-                .entry((start, end))
-                .or_insert_with(|| vec![start_coord, end_coord]);
             if !way.is_oneway {
                 adjacency.entry(end).or_default().push(ConnectorArc {
                     next: start,
                     weight_m,
                     way_id: way.way_id,
                 });
-                arc_coords
-                    .entry((end, start))
-                    .or_insert_with(|| vec![end_coord, start_coord]);
             }
         }
     }
 
-    ConnectorGraph {
-        adjacency,
-        node_coords,
-        arc_coords,
-    }
-}
-
-fn shortest_connector_path_to_nodes(
-    start: i64,
-    targets: &[i64],
-    connector_graph: &ConnectorGraph,
-) -> Option<ConnectorPath> {
-    if targets.is_empty() {
-        return None;
-    }
-
-    let target_set: HashSet<i64> = targets.iter().copied().collect();
-    let mut heap = BinaryHeap::new();
-    let mut dist: HashMap<i64, u64> = HashMap::new();
-    let mut prev: HashMap<i64, (i64, i64)> = HashMap::new();
-
-    dist.insert(start, 0);
-    heap.push(SearchState {
-        cost_m: 0,
-        node: start,
-    });
-
-    while let Some(SearchState { cost_m, node }) = heap.pop() {
-        if cost_m > dist.get(&node).copied().unwrap_or(u64::MAX) {
-            continue;
-        }
-        if node != start && target_set.contains(&node) {
-            return reconstruct_connector_path(start, node, cost_m, &prev, connector_graph);
-        }
-
-        let Some(arcs) = connector_graph.adjacency.get(&node) else {
-            continue;
-        };
-        for arc in arcs {
-            let next_cost = cost_m.saturating_add(arc.weight_m);
-            if next_cost >= dist.get(&arc.next).copied().unwrap_or(u64::MAX) {
-                continue;
-            }
-            dist.insert(arc.next, next_cost);
-            prev.insert(arc.next, (node, arc.way_id));
-            heap.push(SearchState {
-                cost_m: next_cost,
-                node: arc.next,
-            });
-        }
-    }
-
-    None
-}
-
-fn reconstruct_connector_path(
-    start: i64,
-    target: i64,
-    cost_m: u64,
-    prev: &HashMap<i64, (i64, i64)>,
-    connector_graph: &ConnectorGraph,
-) -> Option<ConnectorPath> {
-    let mut node_path = vec![target];
-    let mut way_ids = Vec::new();
-    let mut current = target;
-    while current != start {
-        let &(prev_node, way_id) = prev.get(&current)?;
-        node_path.push(prev_node);
-        way_ids.push(way_id);
-        current = prev_node;
-    }
-    node_path.reverse();
-    way_ids.reverse();
-    way_ids.dedup();
-
-    let mut points = Vec::new();
-    for pair in node_path.windows(2) {
-        let coords = connector_graph
-            .arc_coords
-            .get(&(pair[0], pair[1]))
-            .cloned()
-            .or_else(|| {
-                connector_graph
-                    .arc_coords
-                    .get(&(pair[1], pair[0]))
-                    .map(|coords| {
-                        let mut reversed = coords.clone();
-                        reversed.reverse();
-                        reversed
-                    })
-            })
-            .or_else(|| {
-                Some(vec![
-                    *connector_graph.node_coords.get(&pair[0])?,
-                    *connector_graph.node_coords.get(&pair[1])?,
-                ])
-            })?;
-        append_points_dedup(&mut points, &coords);
-    }
-
-    Some(ConnectorPath {
-        target_node: target,
-        points,
-        way_ids,
-        cost_m,
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OrientationState {
-    Forward,
-    Reverse,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MemberRoleHint {
-    Forward,
-    Backward,
-    Cardinal,
-}
-
-fn member_role_hint(role: Option<&str>) -> Option<MemberRoleHint> {
-    let role = role?.trim().to_ascii_lowercase();
-    if role.is_empty() {
-        return None;
-    }
-    if role.contains("forward") {
-        return Some(MemberRoleHint::Forward);
-    }
-    if role.contains("backward") {
-        return Some(MemberRoleHint::Backward);
-    }
-    if role
-        .split(|ch: char| !ch.is_ascii_alphabetic())
-        .any(|token| matches!(token, "north" | "south" | "east" | "west"))
-    {
-        return Some(MemberRoleHint::Cardinal);
-    }
-    None
-}
-
-fn orientation_preference_penalty(
-    geometry: &[[f64; 2]],
-    orientation: OrientationState,
-    role_hint: Option<MemberRoleHint>,
-    canonical_direction: &str,
-) -> u8 {
-    let mut penalty = 0;
-    match role_hint {
-        Some(MemberRoleHint::Forward) if orientation == OrientationState::Reverse => penalty += 1,
-        Some(MemberRoleHint::Backward) if orientation == OrientationState::Forward => penalty += 1,
-        Some(MemberRoleHint::Cardinal)
-            if !polyline_matches_direction(geometry, canonical_direction) =>
-        {
-            penalty += 1;
-        }
-        _ => {}
-    }
-    if !polyline_matches_direction(geometry, canonical_direction) {
-        penalty += 1;
-    }
-    penalty
-}
-
-fn direction_match_rank(geometry: &[[f64; 2]], canonical_direction: &str) -> u8 {
-    u8::from(!polyline_matches_direction(geometry, canonical_direction))
-}
-
-impl OrientedWay {
-    fn tail_node(&self) -> i64 {
-        *self.nodes.last().unwrap_or(&0)
-    }
+    ConnectorGraph { adjacency }
 }
 
 fn ordered_group_members<'a>(
@@ -1811,14 +1325,6 @@ fn parse_geojson_coords(raw: &str) -> Vec<(f64, f64)> {
 
 fn parse_way_ids_json(raw: &str) -> Vec<i64> {
     serde_json::from_str::<Vec<i64>>(raw).unwrap_or_default()
-}
-
-impl RouteWay {
-    fn has_interstate_ref(&self) -> bool {
-        self.refs
-            .iter()
-            .any(|reference| is_interstate_highway_ref(reference))
-    }
 }
 
 fn allowed_refs_for_pair(prev_way: &RouteWay, next_way: &RouteWay) -> HashSet<String> {
