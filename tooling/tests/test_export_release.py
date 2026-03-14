@@ -128,6 +128,21 @@ class RouteGeometryTests(unittest.TestCase):
         self.assertEqual(geometry["type"], "MultiLineString")
         self.assertEqual(len(geometry["coordinates"]), 2)
 
+    def test_route_geometry_honors_explicit_segmented_waypoints(self) -> None:
+        route = {
+            "waypoints_json": json.dumps(
+                [
+                    [[32.0, -117.0], [32.01, -117.01]],
+                    [[40.0, -75.0], [40.01, -75.01]],
+                ]
+            )
+        }
+
+        geometry = MODULE.route_geometry_geojson(route)
+
+        self.assertEqual(geometry["type"], "MultiLineString")
+        self.assertEqual(len(geometry["coordinates"]), 2)
+
     def test_route_waypoints_to_gpx_emits_multiple_track_segments(self) -> None:
         route = {
             "reference_route_id": "route-1",
@@ -147,6 +162,24 @@ class RouteGeometryTests(unittest.TestCase):
         self.assertEqual(gpx.count("<trkseg>"), 2)
         self.assertIn("route-1-0-0", gpx)
         self.assertIn("route-1-1-1", gpx)
+
+    def test_route_waypoints_to_gpx_preserves_explicit_segments(self) -> None:
+        route = {
+            "reference_route_id": "route-2",
+            "display_name": "I-TEST Southbound",
+            "waypoints_json": json.dumps(
+                [
+                    [[32.0, -117.0], [32.01, -117.01]],
+                    [[40.0, -75.0], [40.01, -75.01]],
+                ]
+            ),
+        }
+
+        gpx = MODULE.route_waypoints_to_gpx(route)
+
+        self.assertEqual(gpx.count("<trkseg>"), 2)
+        self.assertIn("route-2-0-0", gpx)
+        self.assertIn("route-2-1-1", gpx)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ pub struct ParsedExit {
 
 #[derive(Debug, Clone)]
 pub struct ParsedHighway {
+    pub way_id: i64,
     pub refs: Vec<String>,
     pub nodes: Vec<i64>,
     pub geometry: Vec<(f64, f64)>,

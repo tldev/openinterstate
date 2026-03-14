@@ -238,11 +238,39 @@ def split_route_waypoints(
     return segments
 
 
+def is_waypoint_pair(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) >= 2
+        and isinstance(value[0], (int, float))
+        and isinstance(value[1], (int, float))
+    )
+
+
+def route_waypoint_segments(route: dict[str, Any]) -> list[list[list[float]]]:
+    raw = json.loads(route["waypoints_json"])
+    if not isinstance(raw, list) or not raw:
+        return []
+
+    if is_waypoint_pair(raw[0]):
+        waypoints = [[float(pair[0]), float(pair[1])] for pair in raw if is_waypoint_pair(pair)]
+        segments = split_route_waypoints(waypoints)
+        if not segments and len(waypoints) >= 2:
+            segments = [waypoints]
+        return segments
+
+    segments: list[list[list[float]]] = []
+    for segment in raw:
+        if not isinstance(segment, list):
+            continue
+        points = [[float(pair[0]), float(pair[1])] for pair in segment if is_waypoint_pair(pair)]
+        if len(points) >= 2:
+            segments.append(points)
+    return segments
+
+
 def route_geometry_geojson(route: dict[str, Any]) -> dict[str, Any]:
-    waypoints = json.loads(route["waypoints_json"])
-    segments = split_route_waypoints(waypoints)
-    if not segments and len(waypoints) >= 2:
-        segments = [waypoints]
+    segments = route_waypoint_segments(route)
 
     if len(segments) <= 1:
         coords = [[pair[1], pair[0]] for pair in (segments[0] if segments else [])]
@@ -258,10 +286,7 @@ def route_geometry_geojson(route: dict[str, Any]) -> dict[str, Any]:
 
 
 def route_waypoints_to_gpx(route: dict[str, Any]) -> str:
-    waypoints = json.loads(route["waypoints_json"])
-    segments = split_route_waypoints(waypoints)
-    if not segments and len(waypoints) >= 2:
-        segments = [waypoints]
+    segments = route_waypoint_segments(route)
 
     track_segments = []
     for segment_idx, segment in enumerate(segments):
@@ -378,10 +403,10 @@ def main() -> None:
                   c.highway AS interstate_name,
                   c.canonical_direction AS direction_code,
                   initcap(c.canonical_direction) AS direction_label,
-                  ST_AsGeoJSON(ST_LineMerge(ST_Collect(he.geom))) AS geometry_geojson,
+                  c.geometry_json AS geometry_geojson,
                   COUNT(he.id) AS edge_count
                 FROM corridors c
-                JOIN highway_edges he ON he.corridor_id = c.corridor_id
+                LEFT JOIN highway_edges he ON he.corridor_id = c.corridor_id
                 WHERE c.highway ~ '{INTERSTATE_FILTER}'
                 GROUP BY c.corridor_id, c.highway, c.canonical_direction
                 ORDER BY c.highway, c.canonical_direction, c.corridor_id
