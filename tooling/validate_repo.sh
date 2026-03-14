@@ -21,12 +21,17 @@ required_files=(
   "examples/duckdb/example_queries.sql"
   ".env.example"
   "compose.yaml"
+  ".github/workflows/release-build.yml"
   "bin/openinterstate"
   "bin/lib.sh"
   "docker/runner/Dockerfile"
   "schema/bootstrap.sql"
   "schema/derive.sql"
   "schema/osm2pgsql/openinterstate.lua"
+  "tooling/ci/stream_source_pbf.py"
+  "tooling/ci/prefilter_stream.sh"
+  "tooling/ci/build_release_host.sh"
+  "tooling/ci/publish_release.sh"
   "tooling/export_release.py"
   "tooling/requirements.txt"
   "tooling/validate_repo.sh"
@@ -38,7 +43,13 @@ for file in "${required_files[@]}"; do
   test -f "$file"
 done
 
-bash -n bin/openinterstate bin/lib.sh tooling/validate_repo.sh
-python3 -m py_compile tooling/export_release.py
+bash -n \
+  bin/openinterstate \
+  bin/lib.sh \
+  tooling/validate_repo.sh \
+  tooling/ci/prefilter_stream.sh \
+  tooling/ci/build_release_host.sh \
+  tooling/ci/publish_release.sh
+python3 -m py_compile tooling/export_release.py tooling/ci/stream_source_pbf.py
 cargo fmt --all --check
 cargo test --workspace --all-targets

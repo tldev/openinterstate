@@ -46,6 +46,26 @@ Cargo and runner caches now default under the managed data root as well, so a
 goose-drive workspace keeps both data artifacts and Rust build cache off the
 main disk.
 
+## GitHub Actions Workflow
+
+The repo also includes a manual GitHub Actions workflow at
+`.github/workflows/release-build.yml`.
+
+That workflow is designed for standard public GitHub-hosted runners:
+
+1. download the raw U.S. PBF into temporary runner storage
+2. persist only the filtered canonical import PBF plus source metadata as an artifact
+3. rebuild PostGIS, derive product tables, and export the release from that filtered artifact
+4. optionally publish the archive and companion metadata files to GitHub Releases
+
+The raw source file is deleted after filtering and is never passed between jobs
+as an artifact. The only persisted handoff is the filtered canonical import PBF
+plus its source metadata.
+
+The manual `workflow_dispatch` run uses the full U.S. source by default. The
+`pull_request` trigger is intentionally lighter and uses a Rhode Island smoke
+test extract so release-workflow changes can be validated quickly in PRs.
+
 ## Environment Setup
 
 The default local workflow works without any env file and stores working data in
@@ -132,7 +152,7 @@ GeoParquet packaging can follow later.
 
 Every release now records:
 
-1. the raw source PBF path, size, modified time, and SHA-256
+1. the raw source PBF path or streamed source URL, plus size, modified time, and SHA-256
 2. the imported canonical filtered PBF path, size, modified time, and SHA-256
 3. the source download URL when provided
 4. the derivation chain used to produce the release
@@ -140,10 +160,13 @@ Every release now records:
 This lineage is published both inside `manifest.json` and as the standalone
 asset `source_lineage.json`.
 
+When the GitHub Actions workflow streams the raw source instead of storing it on
+disk, `source_pbf.path` is recorded as the downloaded source URL.
+
 ## Published Standalone Release
 
 The current standalone release is published as:
 
-1. GitHub release tag: `release-2026-03-12-goose-rerun-branchfix`
-2. archive: `openinterstate-release-2026-03-12-goose-rerun-branchfix.tar.gz`
+1. GitHub release tag: `release-2026-03-12-coldpath`
+2. archive: `openinterstate-release-2026-03-12-coldpath.tar.gz`
 3. companion files: `manifest.json`, `source_lineage.json`, and `checksums.txt`

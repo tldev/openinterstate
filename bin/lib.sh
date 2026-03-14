@@ -405,6 +405,23 @@ oi_download_pbf() {
   printf '%s\n' "$resolved_output"
 }
 
+oi_canonical_filter_args() {
+  cat <<'EOF'
+n/highway=motorway_junction
+n/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station
+n/tourism=hotel,motel,guest_house
+n/shop=gas
+n/cuisine
+n/highway=rest_area,services
+w/highway=construction
+w/highway=motorway,motorway_link,trunk,trunk_link,rest_area,services
+w/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station
+w/tourism=hotel,motel,guest_house
+w/shop=gas
+w/cuisine
+EOF
+}
+
 oi_filter_pbf() {
   local input_pbf="$1"
   local output_pbf="$2"
@@ -421,20 +438,7 @@ oi_filter_pbf() {
   fi
 
   mkdir -p "$(dirname "$output_pbf")"
-  filter_args=(
-    n/highway=motorway_junction
-    n/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station
-    n/tourism=hotel,motel,guest_house
-    n/shop=gas
-    n/cuisine
-    n/highway=rest_area,services
-    w/highway=construction
-    w/highway=motorway,motorway_link,trunk,trunk_link,rest_area,services
-    w/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station
-    w/tourism=hotel,motel,guest_house
-    w/shop=gas
-    w/cuisine
-  )
+  mapfile -t filter_args < <(oi_canonical_filter_args)
   state_file="$(oi_state_file filter "$output_pbf")"
   expected_signature="$(
     {

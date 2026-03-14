@@ -109,7 +109,6 @@ class SourceFileMetadataTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "sha256"):
                 MODULE.load_source_file_metadata(metadata_path, "source_pbf")
 
-
 class RouteGeometryTests(unittest.TestCase):
     def test_route_geometry_splits_large_gaps_into_multilinestring(self) -> None:
         route = {
