@@ -1,6 +1,5 @@
 mod component_ids;
 mod compress;
-pub mod corridors;
 mod directions;
 pub mod relation_corridors;
 
@@ -28,18 +27,13 @@ use compress::compress_highway_graph;
 /// 7. Write edges into `highway_edges` and corridor entries into `exit_corridors`
 pub async fn build_graph(
     pool: &PgPool,
-    interstate_relation_cache: Option<&Path>,
+    interstate_relation_cache: &Path,
 ) -> Result<usize, anyhow::Error> {
-    let relation_refs_by_way = if let Some(path) = interstate_relation_cache {
-        let refs = load_relation_refs_by_way(path)?;
-        tracing::info!(
-            "Loaded Interstate relation memberships for {} way ids",
-            refs.len()
-        );
-        refs
-    } else {
-        HashMap::new()
-    };
+    let relation_refs_by_way = load_relation_refs_by_way(interstate_relation_cache)?;
+    tracing::info!(
+        "Loaded Interstate relation memberships for {} way ids",
+        relation_refs_by_way.len()
+    );
 
     tracing::info!("Loading highways from osm2pgsql_v2_highways...");
     let highways = load_highways(pool, &relation_refs_by_way).await?;

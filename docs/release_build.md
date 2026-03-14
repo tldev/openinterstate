@@ -85,31 +85,14 @@ If you want to override the defaults, copy `.env.example` to `.env` and update:
 ./bin/openinterstate build
 ```
 
-## Split Commands
+## Publish Step
 
-If you want to run the pipeline in stages:
+After a successful build, publish the generated release to GitHub:
 
 ```bash
-./bin/openinterstate download
-
-./bin/openinterstate import \
-  --pbf-file /abs/path/us-latest.osm.pbf \
-  --force-prefilter
-
-./bin/openinterstate derive
-
-./bin/openinterstate release \
-  --release-id release-$(date +%F)-local \
-  --source-pbf-file /abs/path/us-latest.osm.pbf \
-  --import-pbf-file /abs/path/us-latest.canonical-filtered.osm.pbf \
-  --source-url https://download.geofabrik.de/north-america/us-latest.osm.pbf
-
 ./bin/openinterstate publish \
-  --release-id release-$(date +%F)-local
+  --release-id release-$(date +%F)
 ```
-
-If the database is already up to date, you can rerun just the `release` or
-`publish` steps without re-importing the source PBF.
 
 The main `build` command now also skips current download, filter, import,
 derive, and release stages when their inputs and build scripts have not

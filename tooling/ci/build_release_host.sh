@@ -132,14 +132,13 @@ done
 [[ -n "$RELEASE_ID" ]] || die "--release-id is required"
 [[ -n "$FILTERED_PBF_FILE" ]] || die "--filtered-pbf-file is required"
 [[ -n "$SOURCE_PBF_METADATA_FILE" ]] || die "--source-pbf-metadata-file is required"
+[[ -n "$INTERSTATE_RELATION_CACHE_FILE" ]] || die "--interstate-relation-cache-file is required"
 [[ -n "$OUTPUT_ROOT" ]] || die "--output-root is required"
 [[ -n "$WORK_DIR" ]] || die "--work-dir is required"
 
 [[ -f "$FILTERED_PBF_FILE" ]] || die "filtered PBF not found: $FILTERED_PBF_FILE"
 [[ -f "$SOURCE_PBF_METADATA_FILE" ]] || die "source metadata not found: $SOURCE_PBF_METADATA_FILE"
-if [[ -n "$INTERSTATE_RELATION_CACHE_FILE" ]]; then
-  [[ -f "$INTERSTATE_RELATION_CACHE_FILE" ]] || die "interstate relation cache not found: $INTERSTATE_RELATION_CACHE_FILE"
-fi
+[[ -f "$INTERSTATE_RELATION_CACHE_FILE" ]] || die "interstate relation cache not found: $INTERSTATE_RELATION_CACHE_FILE"
 
 STATE_DIR="${STATE_DIR:-$WORK_DIR/state}"
 DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}"
@@ -258,10 +257,9 @@ DERIVE_ARGS=(
   --
   --database-url
   "$DATABASE_URL"
+  --interstate-relation-cache
+  "$INTERSTATE_RELATION_CACHE_FILE"
 )
-if [[ -n "$INTERSTATE_RELATION_CACHE_FILE" ]]; then
-  DERIVE_ARGS+=(--interstate-relation-cache "$INTERSTATE_RELATION_CACHE_FILE")
-fi
 DERIVE_ARGS+=(all)
 "${DERIVE_ARGS[@]}"
 
