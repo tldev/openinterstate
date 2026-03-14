@@ -78,6 +78,39 @@ local function is_highway_class(v)
         or v == "trunk_link"
 end
 
+local function has_interstate_ref(tags)
+    local ref = nil
+    if tags.ref ~= nil and tags.ref ~= "" then
+        ref = tags.ref
+    elseif tags.int_ref ~= nil and tags.int_ref ~= "" then
+        ref = tags.int_ref
+    else
+        ref = ""
+    end
+
+    for candidate in string.gmatch(ref, "([^;]+)") do
+        local trimmed = candidate:gsub("^%s+", ""):gsub("%s+$", "")
+        if string.match(trimmed, "^[Ii][%s%-]*%d+%a?$") ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
+local function effective_highway_class(tags)
+    local highway = tags.highway
+    if is_highway_class(highway) then
+        return highway
+    end
+    if highway == "construction" and is_highway_class(tags.construction) then
+        return tags.construction
+    end
+    if highway == "construction" and has_interstate_ref(tags) then
+        return "motorway"
+    end
+    return nil
+end
+
 function osm2pgsql.process_node(object)
     local tags = object.tags
 
@@ -106,9 +139,9 @@ end
 
 function osm2pgsql.process_way(object)
     local tags = object.tags
-    local hwy = tags.highway
+    local hwy = effective_highway_class(tags)
 
-    if hwy ~= nil and is_highway_class(hwy) then
+    if hwy ~= nil then
         local geom = object:as_linestring()
         if geom ~= nil then
             -- Format node IDs as PostgreSQL int8[] literal: {id1,id2,...}

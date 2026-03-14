@@ -1,4 +1,5 @@
-use std::collections::{hash_map::Entry, BTreeSet, HashMap, HashSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{hash_map::Entry, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
 use openinterstate_core::geo::haversine_distance;
 use openinterstate_core::highway_ref::is_interstate_highway_ref;
@@ -20,6 +21,7 @@ pub(super) struct CompressedEdge {
     pub(super) min_lon: f64,
     pub(super) max_lon: f64,
     pub(super) polyline_json: String,
+    pub(super) source_way_ids_json: String,
     /// WKT LineString for PostGIS geom column.
     pub(super) geom_wkt: String,
     /// Cardinal direction of this edge's component ("N","S","E","W" or None).
@@ -39,6 +41,39 @@ struct HighwayGraph {
     node_coords: HashMap<i64, (f64, f64)>,
     neighbors_directed: HashMap<i64, BTreeSet<i64>>,
     neighbors_undirected: HashMap<i64, BTreeSet<i64>>,
+    arc_way_ids: HashMap<(i64, i64), BTreeSet<i64>>,
+}
+
+struct ConnectorGraph {
+    adjacency: HashMap<i64, Vec<ConnectorArc>>,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectorArc {
+    next: i64,
+    weight_m: u64,
+    way_id: i64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct SearchState {
+    cost_m: u64,
+    node: i64,
+}
+
+impl Ord for SearchState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost_m
+            .cmp(&self.cost_m)
+            .then_with(|| self.node.cmp(&other.node))
+    }
+}
+
+impl PartialOrd for SearchState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Pure function: compress highway ways into directed edges.
@@ -112,102 +147,346 @@ fn build_exit_node_index(exits: &[ParsedExit]) -> (HashSet<i64>, HashMap<i64, Ve
 }
 
 fn group_ways_by_highway(highways: &[ParsedHighway]) -> HashMap<String, Vec<&ParsedHighway>> {
-    let mut ways_by_highway: HashMap<String, Vec<&ParsedHighway>> = HashMap::new();
+    let mut assigned_way_ids: HashMap<String, BTreeSet<i64>> = HashMap::new();
+    let mut ways_by_id: HashMap<i64, &ParsedHighway> = HashMap::new();
     let mut refless_motorways: Vec<&ParsedHighway> = Vec::new();
+    let mut blank_ref_connectors: Vec<&ParsedHighway> = Vec::new();
 
     for way in highways {
-        // Skip motorway_link ways that don't carry a ref — these are exit ramps.
-        // Links WITH a ref (e.g. "I 40") are mainline connectors at interchanges
-        // where interstates merge/split.
-        if way.highway_type == "motorway_link" && way.refs.is_empty() {
-            continue;
-        }
+        ways_by_id.insert(way.way_id, way);
 
-        if way.refs.is_empty() && way.highway_type == "motorway" {
-            // Refless motorway ways (e.g. "Sam Cooper Boulevard" in Memphis is
-            // physically I-40 but tagged without ref). Collect for node-based
-            // assignment in a second pass onto an Interstate graph.
-            refless_motorways.push(way);
-            continue;
-        }
-
-        for reference in &way.refs {
-            if is_interstate_highway_ref(reference) {
-                ways_by_highway
-                    .entry(reference.clone())
+        let interstate_refs: Vec<String> = way
+            .refs
+            .iter()
+            .filter(|reference| is_interstate_highway_ref(reference))
+            .cloned()
+            .collect();
+        if !interstate_refs.is_empty() {
+            for highway in interstate_refs {
+                assigned_way_ids
+                    .entry(highway)
                     .or_default()
-                    .push(way);
+                    .insert(way.way_id);
+            }
+            continue;
+        }
+
+        if way.refs.is_empty() {
+            blank_ref_connectors.push(way);
+            if way.highway_type == "motorway" {
+                refless_motorways.push(way);
             }
         }
     }
 
-    // Second pass: assign refless motorway ways to highways via shared OSM nodes.
-    // Build node → set of highways index from the first pass.
-    if !refless_motorways.is_empty() {
-        let mut node_highways: HashMap<i64, HashSet<String>> = HashMap::new();
-        for (highway, ways) in &ways_by_highway {
-            for way in ways {
-                for &node_id in &way.nodes {
-                    node_highways
-                        .entry(node_id)
-                        .or_default()
-                        .insert(highway.clone());
-                }
-            }
-        }
+    adopt_refless_motorways_by_shared_nodes(&mut assigned_way_ids, &refless_motorways, &ways_by_id);
 
-        // Iterate to handle chains of refless ways (A→B→C where only A touches a ref'd way).
-        let mut remaining = refless_motorways;
-        let mut total_assigned = 0usize;
-        loop {
-            let mut unmatched: Vec<&ParsedHighway> = Vec::new();
-            let mut assigned_this_round = 0usize;
-            for way in remaining {
-                let mut matched: HashSet<String> = HashSet::new();
-                for &node_id in &way.nodes {
-                    if let Some(hws) = node_highways.get(&node_id) {
-                        matched.extend(hws.iter().cloned());
-                    }
-                }
-                if matched.is_empty() {
-                    unmatched.push(way);
-                } else {
-                    for highway in &matched {
-                        ways_by_highway
-                            .entry(highway.clone())
-                            .or_default()
-                            .push(way);
-                    }
-                    for &node_id in &way.nodes {
-                        node_highways
-                            .entry(node_id)
-                            .or_default()
-                            .extend(matched.iter().cloned());
-                    }
-                    assigned_this_round += 1;
-                }
-            }
-            total_assigned += assigned_this_round;
-            if assigned_this_round == 0 {
-                break;
-            }
-            remaining = unmatched;
-        }
-        if total_assigned > 0 {
-            tracing::info!(
-                "Adopted {} refless motorway ways via shared nodes",
-                total_assigned
-            );
-        }
+    let connector_graph = build_blank_ref_connector_graph(&blank_ref_connectors);
+    adopt_blank_ref_connector_paths(&mut assigned_way_ids, &ways_by_id, &connector_graph);
+
+    let mut ways_by_highway: HashMap<String, Vec<&ParsedHighway>> = HashMap::new();
+    for (highway, way_ids) in assigned_way_ids {
+        let mut ways: Vec<&ParsedHighway> = way_ids
+            .into_iter()
+            .filter_map(|way_id| ways_by_id.get(&way_id).copied())
+            .collect();
+        ways.sort_by_key(|way| way.way_id);
+        ways_by_highway.insert(highway, ways);
     }
 
     ways_by_highway
+}
+
+fn adopt_refless_motorways_by_shared_nodes(
+    assigned_way_ids: &mut HashMap<String, BTreeSet<i64>>,
+    refless_motorways: &[&ParsedHighway],
+    ways_by_id: &HashMap<i64, &ParsedHighway>,
+) {
+    if refless_motorways.is_empty() {
+        return;
+    }
+
+    let mut node_highways: HashMap<i64, HashSet<String>> = HashMap::new();
+    for (highway, way_ids) in assigned_way_ids.iter() {
+        for way_id in way_ids {
+            let Some(way) = ways_by_id.get(way_id).copied() else {
+                continue;
+            };
+            for &node_id in &way.nodes {
+                node_highways
+                    .entry(node_id)
+                    .or_default()
+                    .insert(highway.clone());
+            }
+        }
+    }
+
+    let mut remaining = refless_motorways.to_vec();
+    let mut total_assigned = 0usize;
+    loop {
+        let mut unmatched: Vec<&ParsedHighway> = Vec::new();
+        let mut assigned_this_round = 0usize;
+        for way in remaining {
+            let mut matched: HashSet<String> = HashSet::new();
+            for &node_id in &way.nodes {
+                if let Some(highways) = node_highways.get(&node_id) {
+                    matched.extend(highways.iter().cloned());
+                }
+            }
+            if matched.is_empty() {
+                unmatched.push(way);
+                continue;
+            }
+
+            for highway in &matched {
+                assigned_way_ids
+                    .entry(highway.clone())
+                    .or_default()
+                    .insert(way.way_id);
+            }
+            for &node_id in &way.nodes {
+                node_highways
+                    .entry(node_id)
+                    .or_default()
+                    .extend(matched.iter().cloned());
+            }
+            assigned_this_round += 1;
+        }
+        total_assigned += assigned_this_round;
+        if assigned_this_round == 0 {
+            break;
+        }
+        remaining = unmatched;
+    }
+
+    if total_assigned > 0 {
+        tracing::info!(
+            "Adopted {} refless motorway ways via shared nodes",
+            total_assigned
+        );
+    }
+}
+
+fn build_blank_ref_connector_graph(ways: &[&ParsedHighway]) -> ConnectorGraph {
+    let mut adjacency: HashMap<i64, Vec<ConnectorArc>> = HashMap::new();
+
+    for way in ways {
+        if way.nodes.len() < 2 || way.geometry.len() < 2 || way.nodes.len() != way.geometry.len() {
+            continue;
+        }
+
+        for idx in 0..way.nodes.len() - 1 {
+            let start = way.nodes[idx];
+            let end = way.nodes[idx + 1];
+            let start_coord = way.geometry[idx];
+            let end_coord = way.geometry[idx + 1];
+            let weight_m =
+                haversine_distance(start_coord.0, start_coord.1, end_coord.0, end_coord.1)
+                    .round()
+                    .max(1.0) as u64;
+
+            adjacency.entry(start).or_default().push(ConnectorArc {
+                next: end,
+                weight_m,
+                way_id: way.way_id,
+            });
+            if !way.is_oneway {
+                adjacency.entry(end).or_default().push(ConnectorArc {
+                    next: start,
+                    weight_m,
+                    way_id: way.way_id,
+                });
+            }
+        }
+    }
+
+    ConnectorGraph { adjacency }
+}
+
+fn adopt_blank_ref_connector_paths(
+    assigned_way_ids: &mut HashMap<String, BTreeSet<i64>>,
+    ways_by_id: &HashMap<i64, &ParsedHighway>,
+    connector_graph: &ConnectorGraph,
+) {
+    let mut highways: Vec<String> = assigned_way_ids.keys().cloned().collect();
+    highways.sort();
+
+    for highway in highways {
+        let mut total_adopted = 0usize;
+
+        loop {
+            let Some(assigned_ids) = assigned_way_ids.get(&highway) else {
+                break;
+            };
+            let assigned_ways: Vec<&ParsedHighway> = assigned_ids
+                .iter()
+                .filter_map(|way_id| ways_by_id.get(way_id).copied())
+                .collect();
+            let components = highway_connected_components(&assigned_ways);
+            if components.len() <= 1 {
+                break;
+            }
+
+            let mut best_path: Option<(u64, i32, Vec<i64>)> = None;
+            for (source_comp, source_nodes, _) in &components {
+                let mut target_components_by_node: HashMap<i64, i32> = HashMap::new();
+                for (target_comp, target_nodes, _) in &components {
+                    if target_comp == source_comp {
+                        continue;
+                    }
+                    for &node_id in target_nodes {
+                        target_components_by_node.insert(node_id, *target_comp);
+                    }
+                }
+
+                let Some(candidate) = shortest_connector_path_to_any(
+                    source_nodes,
+                    &target_components_by_node,
+                    connector_graph,
+                ) else {
+                    continue;
+                };
+                if best_path
+                    .as_ref()
+                    .is_none_or(|(best_cost, _, _)| candidate.0 < *best_cost)
+                {
+                    best_path = Some(candidate);
+                }
+            }
+
+            let Some((_cost_m, target_comp, path_way_ids)) = best_path else {
+                break;
+            };
+
+            let entry = assigned_way_ids.entry(highway.clone()).or_default();
+            let mut adopted_this_round = 0usize;
+            for way_id in path_way_ids {
+                adopted_this_round += usize::from(entry.insert(way_id));
+            }
+
+            if adopted_this_round == 0 {
+                tracing::debug!(
+                    "{}: connector path to component {} yielded no new ways",
+                    highway,
+                    target_comp
+                );
+                break;
+            }
+            total_adopted += adopted_this_round;
+        }
+
+        if total_adopted > 0 {
+            tracing::info!(
+                "Adopted {} blank-ref connector ways via graph search for {}",
+                total_adopted,
+                highway
+            );
+        }
+    }
+}
+
+fn highway_connected_components(ways: &[&ParsedHighway]) -> Vec<(i32, HashSet<i64>, usize)> {
+    let Some(graph) = build_highway_graph(ways) else {
+        return Vec::new();
+    };
+    let component_by_node = compute_components(&graph.neighbors_undirected);
+    let mut nodes_by_component: HashMap<i32, HashSet<i64>> = HashMap::new();
+    let mut way_count_by_component: HashMap<i32, usize> = HashMap::new();
+
+    for way in ways {
+        let Some(first_node) = way.nodes.first() else {
+            continue;
+        };
+        let Some(&component) = component_by_node.get(first_node) else {
+            continue;
+        };
+        *way_count_by_component.entry(component).or_default() += 1;
+        nodes_by_component
+            .entry(component)
+            .or_default()
+            .extend(way.nodes.iter().copied());
+    }
+
+    let mut components: Vec<(i32, HashSet<i64>, usize)> = nodes_by_component
+        .into_iter()
+        .map(|(component, nodes)| {
+            (
+                component,
+                nodes,
+                way_count_by_component.get(&component).copied().unwrap_or(0),
+            )
+        })
+        .collect();
+    components.sort_by_key(|(component, _, _)| *component);
+    components
+}
+
+fn shortest_connector_path_to_any(
+    sources: &HashSet<i64>,
+    targets_by_node: &HashMap<i64, i32>,
+    connector_graph: &ConnectorGraph,
+) -> Option<(u64, i32, Vec<i64>)> {
+    if sources.is_empty() || targets_by_node.is_empty() {
+        return None;
+    }
+
+    let mut heap = BinaryHeap::new();
+    let mut dist: HashMap<i64, u64> = HashMap::new();
+    let mut prev: HashMap<i64, (i64, i64)> = HashMap::new();
+
+    for &source in sources {
+        dist.insert(source, 0);
+        heap.push(SearchState {
+            cost_m: 0,
+            node: source,
+        });
+    }
+
+    while let Some(SearchState { cost_m, node }) = heap.pop() {
+        if cost_m > dist.get(&node).copied().unwrap_or(u64::MAX) {
+            continue;
+        }
+
+        if let Some(&target_component) = targets_by_node.get(&node) {
+            if !sources.contains(&node) {
+                let mut way_ids = Vec::new();
+                let mut current = node;
+                while !sources.contains(&current) {
+                    let &(prev_node, way_id) = prev.get(&current)?;
+                    way_ids.push(way_id);
+                    current = prev_node;
+                }
+                way_ids.reverse();
+                way_ids.dedup();
+                return Some((cost_m, target_component, way_ids));
+            }
+        }
+
+        let Some(arcs) = connector_graph.adjacency.get(&node) else {
+            continue;
+        };
+        for arc in arcs {
+            let next_cost = cost_m.saturating_add(arc.weight_m);
+            if next_cost >= dist.get(&arc.next).copied().unwrap_or(u64::MAX) {
+                continue;
+            }
+            dist.insert(arc.next, next_cost);
+            prev.insert(arc.next, (node, arc.way_id));
+            heap.push(SearchState {
+                cost_m: next_cost,
+                node: arc.next,
+            });
+        }
+    }
+
+    None
 }
 
 fn build_highway_graph(highway_ways: &[&ParsedHighway]) -> Option<HighwayGraph> {
     let mut node_coords: HashMap<i64, (f64, f64)> = HashMap::new();
     let mut neighbors_directed: HashMap<i64, BTreeSet<i64>> = HashMap::new();
     let mut neighbors_undirected: HashMap<i64, BTreeSet<i64>> = HashMap::new();
+    let mut arc_way_ids: HashMap<(i64, i64), BTreeSet<i64>> = HashMap::new();
 
     for way in highway_ways {
         if way.nodes.len() < 2 || way.geometry.len() < 2 || way.nodes.len() != way.geometry.len() {
@@ -223,8 +502,16 @@ fn build_highway_graph(highway_ways: &[&ParsedHighway]) -> Option<HighwayGraph> 
             let end = way.nodes[idx + 1];
 
             neighbors_directed.entry(start).or_default().insert(end);
+            arc_way_ids
+                .entry((start, end))
+                .or_default()
+                .insert(way.way_id);
             if !way.is_oneway {
                 neighbors_directed.entry(end).or_default().insert(start);
+                arc_way_ids
+                    .entry((end, start))
+                    .or_default()
+                    .insert(way.way_id);
             }
 
             neighbors_undirected.entry(start).or_default().insert(end);
@@ -239,6 +526,7 @@ fn build_highway_graph(highway_ways: &[&ParsedHighway]) -> Option<HighwayGraph> 
             node_coords,
             neighbors_directed,
             neighbors_undirected,
+            arc_way_ids,
         })
     }
 }
@@ -342,6 +630,11 @@ fn walk_compressed_edges(
             let mut polyline = vec![start_coord, first_coord];
             let mut length_m =
                 haversine_distance(start_coord.0, start_coord.1, first_coord.0, first_coord.1);
+            let mut source_way_ids: BTreeSet<i64> = graph
+                .arc_way_ids
+                .get(&first_edge)
+                .cloned()
+                .unwrap_or_default();
             visited_directed.insert(first_edge);
 
             let mut prev = start_node;
@@ -375,6 +668,9 @@ fn walk_compressed_edges(
                 polyline.push(next_coord);
                 length_m +=
                     haversine_distance(cur_coord.0, cur_coord.1, next_coord.0, next_coord.1);
+                if let Some(way_ids) = graph.arc_way_ids.get(&next_edge) {
+                    source_way_ids.extend(way_ids.iter().copied());
+                }
                 visited_directed.insert(next_edge);
 
                 prev = cur;
@@ -402,6 +698,9 @@ fn walk_compressed_edges(
                     .collect::<Vec<_>>(),
             )
             .unwrap_or_else(|_| "[]".to_string());
+            let source_way_ids_json =
+                serde_json::to_string(&source_way_ids.into_iter().collect::<Vec<_>>())
+                    .unwrap_or_else(|_| "[]".to_string());
             let geom_wkt = polyline_to_linestring_wkt(&polyline);
 
             edges.push(CompressedEdge {
@@ -416,6 +715,7 @@ fn walk_compressed_edges(
                 min_lon,
                 max_lon,
                 polyline_json,
+                source_way_ids_json,
                 geom_wkt,
                 direction: None,
             });
@@ -513,17 +813,33 @@ mod tests {
     }
 
     fn sample_highway(
-        _id: &str,
+        id: &str,
         refs: &[&str],
         nodes: &[i64],
         geometry: &[(f64, f64)],
     ) -> ParsedHighway {
+        sample_highway_kind(id, "motorway", refs, nodes, geometry, true)
+    }
+
+    fn sample_highway_kind(
+        id: &str,
+        highway_type: &str,
+        refs: &[&str],
+        nodes: &[i64],
+        geometry: &[(f64, f64)],
+        is_oneway: bool,
+    ) -> ParsedHighway {
         ParsedHighway {
+            way_id: id
+                .split('/')
+                .nth(1)
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0),
             refs: refs.iter().map(|value| (*value).to_string()).collect(),
             nodes: nodes.to_vec(),
             geometry: geometry.to_vec(),
-            highway_type: "motorway".to_string(),
-            is_oneway: true,
+            highway_type: highway_type.to_string(),
+            is_oneway,
         }
     }
 
@@ -605,5 +921,45 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].highway, "I-280");
         assert!(corridor_entries.is_empty());
+    }
+
+    #[test]
+    fn adopts_blank_ref_motorway_link_connector_paths() {
+        let highways = vec![
+            sample_highway(
+                "way/1",
+                &["I-95"],
+                &[1, 2],
+                &[(39.0, -76.0), (39.01, -76.0)],
+            ),
+            sample_highway_kind(
+                "way/2",
+                "motorway_link",
+                &[],
+                &[2, 3],
+                &[(39.01, -76.0), (39.02, -75.99)],
+                true,
+            ),
+            sample_highway(
+                "way/3",
+                &["I-95"],
+                &[3, 4],
+                &[(39.02, -75.99), (39.03, -75.98)],
+            ),
+        ];
+
+        let (edges, _) = compress_highway_graph(&highways, &[]);
+
+        let i95_edges: Vec<&CompressedEdge> =
+            edges.iter().filter(|edge| edge.highway == "I-95").collect();
+        let components: HashSet<i32> = i95_edges.iter().map(|edge| edge.component).collect();
+        assert_eq!(
+            components.len(),
+            1,
+            "blank-ref connector should unify the highway graph"
+        );
+        assert!(i95_edges
+            .iter()
+            .any(|edge| edge.start_node == 1 && edge.end_node == 4));
     }
 }

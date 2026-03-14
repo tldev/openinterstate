@@ -53,12 +53,15 @@ CREATE TABLE IF NOT EXISTS highway_edges (
     min_lon DOUBLE PRECISION NOT NULL,
     max_lon DOUBLE PRECISION NOT NULL,
     polyline_json TEXT NOT NULL,
+    source_way_ids_json TEXT NOT NULL DEFAULT '[]',
     direction TEXT
 );
 CREATE INDEX IF NOT EXISTS highway_edges_geom_idx ON highway_edges USING GIST (geom);
 CREATE INDEX IF NOT EXISTS highway_edges_corridor_idx ON highway_edges (highway, component);
 CREATE INDEX IF NOT EXISTS highway_edges_start_node_idx ON highway_edges (start_node);
 CREATE INDEX IF NOT EXISTS highway_edges_end_node_idx ON highway_edges (end_node);
+ALTER TABLE highway_edges
+    ADD COLUMN IF NOT EXISTS source_way_ids_json TEXT NOT NULL DEFAULT '[]';
 
 -- Corridor tables (populated by openinterstate-derive after this SQL)
 ALTER TABLE highway_edges ADD COLUMN IF NOT EXISTS corridor_id INTEGER;
@@ -67,9 +70,18 @@ CREATE INDEX IF NOT EXISTS highway_edges_corridor_id_idx ON highway_edges (corri
 CREATE TABLE IF NOT EXISTS corridors (
     corridor_id INTEGER PRIMARY KEY,
     highway TEXT NOT NULL,
-    canonical_direction TEXT
+    canonical_direction TEXT,
+    root_relation_id BIGINT,
+    geometry_json TEXT NOT NULL DEFAULT '[]',
+    source_way_ids_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS corridors_highway_idx ON corridors (highway);
+ALTER TABLE corridors
+    ADD COLUMN IF NOT EXISTS root_relation_id BIGINT;
+ALTER TABLE corridors
+    ADD COLUMN IF NOT EXISTS geometry_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE corridors
+    ADD COLUMN IF NOT EXISTS source_way_ids_json TEXT NOT NULL DEFAULT '[]';
 
 CREATE TABLE IF NOT EXISTS corridor_exits (
     corridor_id INTEGER NOT NULL,

@@ -1,6 +1,9 @@
 mod canonical_types;
 mod graph;
+mod interstate_relations;
 mod routes;
+
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use sqlx::PgPool;
@@ -16,6 +19,10 @@ struct Cli {
     #[arg(long, env = "DATABASE_URL")]
     database_url: String,
 
+    /// Optional cached Interstate route relation membership file.
+    #[arg(long, env = "INTERSTATE_RELATION_CACHE")]
+    interstate_relation_cache: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -26,9 +33,9 @@ enum Command {
     All,
     /// Rebuild highway_edges and exit_corridors from canonical osm2pgsql tables.
     Graph,
-    /// Rebuild corridors and corridor_exits from highway_edges.
+    /// Rebuild official Interstate corridors and corridor_exits.
     Corridors,
-    /// Rebuild reference_routes and reference_route_anchors from corridors.
+    /// Rebuild reference_routes and reference_route_anchors from official corridors.
     Routes,
 }
 
@@ -48,14 +55,19 @@ fn init_tracing() {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
-    let pool = connect_pool(&cli.database_url).await?;
+    let Cli {
+        database_url,
+        interstate_relation_cache,
+        command,
+    } = cli;
+    let pool = connect_pool(&database_url).await?;
     tracing::info!("Connected to database");
 
-    match cli.command {
-        Command::All => run_all(&pool).await,
-        Command::Graph => run_graph(&pool).await,
-        Command::Corridors => run_corridors(&pool).await,
-        Command::Routes => run_routes(&pool).await,
+    match command {
+        Command::All => run_all(&pool, interstate_relation_cache.as_deref()).await,
+        Command::Graph => run_graph(&pool, interstate_relation_cache.as_deref()).await,
+        Command::Corridors => run_corridors(&pool, interstate_relation_cache.as_deref()).await,
+        Command::Routes => run_routes(&pool, interstate_relation_cache.as_deref()).await,
     }
 }
 
@@ -66,22 +78,25 @@ async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
         .await?)
 }
 
-async fn run_all(pool: &PgPool) -> anyhow::Result<()> {
-    run_graph(pool).await?;
-    run_corridors(pool).await?;
-    run_routes(pool).await
+async fn run_all(pool: &PgPool, interstate_relation_cache: Option<&Path>) -> anyhow::Result<()> {
+    run_graph(pool, interstate_relation_cache).await?;
+    run_corridors(pool, interstate_relation_cache).await?;
+    run_routes(pool, interstate_relation_cache).await
 }
 
-async fn run_graph(pool: &PgPool) -> anyhow::Result<()> {
+async fn run_graph(pool: &PgPool, interstate_relation_cache: Option<&Path>) -> anyhow::Result<()> {
     tracing::info!("Building highway graph from canonical osm2pgsql tables");
-    let edge_count = graph::build_graph(pool).await?;
+    let edge_count = graph::build_graph(pool, interstate_relation_cache).await?;
     tracing::info!("Graph build complete: {} edges", edge_count);
     Ok(())
 }
 
-async fn run_corridors(pool: &PgPool) -> anyhow::Result<()> {
-    tracing::info!("Building corridors from highway_edges");
-    let stats = graph::corridors::build_corridors(pool).await?;
+async fn run_corridors(
+    pool: &PgPool,
+    interstate_relation_cache: Option<&Path>,
+) -> anyhow::Result<()> {
+    tracing::info!("Building Interstate corridors");
+    let stats = graph::relation_corridors::build_corridors(pool, interstate_relation_cache).await?;
     tracing::info!(
         "Corridor build complete: {} corridors, {} exits, {} edges updated",
         stats.corridors_created,
@@ -91,9 +106,9 @@ async fn run_corridors(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_routes(pool: &PgPool) -> anyhow::Result<()> {
+async fn run_routes(pool: &PgPool, interstate_relation_cache: Option<&Path>) -> anyhow::Result<()> {
     tracing::info!("Building reference routes from corridors");
-    routes::build_reference_routes(pool).await?;
+    routes::build_reference_routes(pool, interstate_relation_cache).await?;
     tracing::info!("Reference route build complete");
     Ok(())
 }

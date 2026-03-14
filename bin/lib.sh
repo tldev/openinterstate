@@ -413,6 +413,7 @@ n/tourism=hotel,motel,guest_house
 n/shop=gas
 n/cuisine
 n/highway=rest_area,services
+w/highway=construction
 w/highway=motorway,motorway_link,trunk,trunk_link,rest_area,services
 w/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station
 w/tourism=hotel,motel,guest_house
@@ -447,7 +448,7 @@ oi_filter_pbf() {
   )"
   if [[ "$force" != true && -s "$output_pbf" ]]; then
     if [[ "$(oi_state_read "$state_file" signature 2>/dev/null || true)" == "$expected_signature" ]] \
-      || [[ ! "$input_pbf" -nt "$output_pbf" ]]; then
+      && [[ ! "$input_pbf" -nt "$output_pbf" ]]; then
       oi_log "Skipping canonical filter; output is current"
       echo "  output: $output_pbf" >&2
       oi_state_write "$state_file" \
@@ -482,6 +483,123 @@ oi_filter_pbf() {
     input_pbf "$input_pbf" \
     output_pbf "$output_pbf" \
     completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf '%s\n' "$output_pbf"
+}
+
+oi_safe_slug() {
+  local raw="${1:-}"
+  local slug
+
+  slug="$(
+    printf '%s' "$raw" \
+      | LC_ALL=C tr -cs 'A-Za-z0-9._-' '-' \
+      | sed -e 's/^-*//' -e 's/-*$//'
+  )"
+
+  if [[ -z "$slug" ]]; then
+    slug="focus"
+  fi
+
+  printf '%s\n' "$slug"
+}
+
+oi_expand_bbox() {
+  local bbox="$1"
+  local buffer_km="${2:-0}"
+
+  python3 - "$bbox" "$buffer_km" <<'PY'
+import math
+import sys
+
+bbox = sys.argv[1]
+buffer_km = float(sys.argv[2])
+parts = [float(part.strip()) for part in bbox.split(",") if part.strip()]
+if len(parts) != 4:
+    raise SystemExit("bbox must be LONG1,LAT1,LONG2,LAT2")
+
+left, bottom, right, top = parts
+left, right = sorted((left, right))
+bottom, top = sorted((bottom, top))
+
+if buffer_km > 0:
+    lat_pad = buffer_km / 111.32
+    mid_lat = (bottom + top) / 2.0
+    lon_scale = max(math.cos(math.radians(mid_lat)) * 111.32, 0.01)
+    lon_pad = buffer_km / lon_scale
+    left -= lon_pad
+    right += lon_pad
+    bottom -= lat_pad
+    top += lat_pad
+
+print(f"{left:.7f},{bottom:.7f},{right:.7f},{top:.7f}")
+PY
+}
+
+oi_extract_region_pbf() {
+  local source_pbf="$1"
+  local output_pbf="$2"
+  local bbox="$3"
+  local buffer_km="${4:-0}"
+  local force="${5:-false}"
+  local output_tmp expanded_bbox state_file expected_signature
+
+  source_pbf="$(oi_abs_path "$source_pbf")"
+  output_pbf="$(oi_managed_path "$output_pbf")"
+
+  if [[ ! -f "$source_pbf" ]]; then
+    oi_die "source PBF not found: $source_pbf"
+  fi
+
+  mkdir -p "$(dirname "$output_pbf")"
+  expanded_bbox="$(oi_expand_bbox "$bbox" "$buffer_km")"
+  state_file="$(oi_state_file extract "$output_pbf")"
+  expected_signature="$(
+    {
+      oi_file_signature "$source_pbf"
+      printf 'bbox=%s\n' "$expanded_bbox"
+      printf 'strategy=complete_ways\n'
+    } | oi_hash_stdin
+  )"
+
+  if [[ "$force" != true && -s "$output_pbf" ]]; then
+    if [[ "$(oi_state_read "$state_file" signature 2>/dev/null || true)" == "$expected_signature" ]] \
+      && [[ ! "$source_pbf" -nt "$output_pbf" ]]; then
+      oi_log "Skipping focused extract; output is current"
+      echo "  bbox: $expanded_bbox" >&2
+      echo "  output: $output_pbf" >&2
+      printf '%s\n' "$output_pbf"
+      return 0
+    fi
+  fi
+
+  if [[ "$output_pbf" == *.osm.pbf ]]; then
+    output_tmp="${output_pbf%.osm.pbf}.tmp.$$.osm.pbf"
+  else
+    output_tmp="${output_pbf}.tmp.$$"
+  fi
+
+  oi_log "Extracting focused regional PBF"
+  echo "  source: $source_pbf" >&2
+  echo "  bbox: $expanded_bbox" >&2
+  echo "  output: $output_pbf" >&2
+
+  oi_require_cmd osmium
+  osmium extract \
+    --bbox "$expanded_bbox" \
+    --strategy=complete_ways \
+    --set-bounds \
+    "$source_pbf" \
+    -o "$output_tmp" \
+    -O
+
+  mv "$output_tmp" "$output_pbf"
+  oi_state_write "$state_file" \
+    signature "$expected_signature" \
+    source_pbf "$source_pbf" \
+    bbox "$expanded_bbox" \
+    output_pbf "$output_pbf" \
+    completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
   printf '%s\n' "$output_pbf"
 }
 
@@ -715,6 +833,7 @@ oi_import_canonical() {
   oi_assert_canonical_import_ready
   oi_state_write "$import_state_file" \
     signature "$import_signature" \
+    source_pbf "$source_pbf" \
     import_pbf "$import_pbf" \
     mode "$import_mode" \
     use_flatnodes "$use_flatnodes" \
@@ -723,10 +842,55 @@ oi_import_canonical() {
   printf '%s\n' "$import_pbf"
 }
 
+oi_extract_interstate_relation_cache() {
+  local import_state_file source_pbf extractor_script cache_path cache_state_file
+  local cache_signature stored_signature
+
+  import_state_file="$(oi_state_file import "$OI_DATA_ROOT|$OI_DB_NAME")"
+  source_pbf="$(oi_state_read "$import_state_file" source_pbf 2>/dev/null || true)"
+  if [[ -z "$source_pbf" || ! -f "$source_pbf" ]]; then
+    if [[ -f "$OI_DOWNLOAD_DIR/us-latest.osm.pbf" ]]; then
+      source_pbf="$OI_DOWNLOAD_DIR/us-latest.osm.pbf"
+    else
+      printf '%s\n' ""
+      return 0
+    fi
+  fi
+
+  extractor_script="$REPO_ROOT/tooling/extract_interstate_relations.py"
+  cache_path="$OI_CACHE_DIR/interstate-relations.tsv"
+  cache_state_file="$(oi_state_file interstate-relations "$OI_DATA_ROOT|$OI_DB_NAME")"
+  cache_signature="$(
+    {
+      oi_file_signature "$source_pbf"
+      printf 'extractor=%s\n' "$(oi_hash_files "$extractor_script")"
+    } | oi_hash_stdin
+  )"
+  stored_signature="$(oi_state_read "$cache_state_file" signature 2>/dev/null || true)"
+
+  if [[ -f "$cache_path" && "$stored_signature" == "$cache_signature" ]]; then
+    printf '%s\n' "$cache_path"
+    return 0
+  fi
+
+  oi_log "Extracting Interstate relation cache from source PBF"
+  python3 "$extractor_script" \
+    --source-pbf "$source_pbf" \
+    --output "$cache_path"
+
+  oi_state_write "$cache_state_file" \
+    signature "$cache_signature" \
+    source_pbf "$source_pbf" \
+    cache_path "$cache_path" \
+    completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+  printf '%s\n' "$cache_path"
+}
+
 oi_apply_derive() {
   local derive_file="$REPO_ROOT/schema/derive.sql"
   local derive_state_file import_state_file import_signature derive_signature derive_sql_signature derive_code_signature
-  local reachability_signature
+  local reachability_signature relation_cache_file relation_cache_signature
   local -a derive_source_files=()
 
   oi_guard_no_reachability_clears "$derive_file"
@@ -749,6 +913,12 @@ oi_apply_derive() {
   )
   derive_sql_signature="$(oi_hash_files "$derive_file")"
   derive_code_signature="$(oi_hash_files "${derive_source_files[@]}")"
+  relation_cache_file="$(oi_extract_interstate_relation_cache)"
+  if [[ -n "$relation_cache_file" && -f "$relation_cache_file" ]]; then
+    relation_cache_signature="$(oi_file_signature "$relation_cache_file")"
+  else
+    relation_cache_signature="no-relation-cache"
+  fi
   reachability_signature="$(
     {
       oi_db_query "SELECT COUNT(*), COALESCE(MAX(updated_at)::text, '') FROM exit_poi_reachability;" 2>/dev/null || true
@@ -760,6 +930,7 @@ oi_apply_derive() {
       printf 'import=%s\n' "$import_signature"
       printf 'derive_sql=%s\n' "$derive_sql_signature"
       printf 'derive_code=%s\n' "$derive_code_signature"
+      printf 'relation_cache=%s\n' "$relation_cache_signature"
       printf 'reachability=%s\n' "$reachability_signature"
     } | oi_hash_stdin
   )"
@@ -773,9 +944,16 @@ oi_apply_derive() {
   oi_db_exec psql -U "$OI_DB_USER" -d "$OI_DB_NAME" -v ON_ERROR_STOP=1 < "$derive_file"
 
   oi_log "Building graph, corridors, and reference routes"
-  oi_runner cargo run --release -p openinterstate-derive -- \
-    --database-url "$PRODUCT_DB_URL" \
-    all
+  if [[ -n "$relation_cache_file" && -f "$relation_cache_file" ]]; then
+    oi_runner cargo run --release -p openinterstate-derive -- \
+      --database-url "$PRODUCT_DB_URL" \
+      --interstate-relation-cache "$(oi_container_path "$relation_cache_file")" \
+      all
+  else
+    oi_runner cargo run --release -p openinterstate-derive -- \
+      --database-url "$PRODUCT_DB_URL" \
+      all
+  fi
   oi_state_write "$derive_state_file" \
     signature "$derive_signature" \
     import_signature "$import_signature" \

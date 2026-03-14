@@ -2,11 +2,16 @@ mod component_ids;
 mod compress;
 pub mod corridors;
 mod directions;
+pub mod relation_corridors;
+
+use std::collections::HashMap;
+use std::path::Path;
 
 use openinterstate_core::highway_ref::{is_interstate_highway_ref, normalize_highway_ref};
 use sqlx::PgPool;
 
 use crate::canonical_types::{ParsedExit, ParsedHighway};
+use crate::interstate_relations::load_relation_refs_by_way;
 
 use component_ids::stabilize_component_ids;
 use compress::compress_highway_graph;
@@ -15,15 +20,29 @@ use compress::compress_highway_graph;
 /// `highway_edges` + `exit_corridors`.
 ///
 /// 1. Load highways and exits from osm2pgsql canonical tables
-/// 2. Group ways by highway ref (include motorway_link only when it carries a ref)
+/// 2. Group ways by highway ref and adopt unlabeled high-class connector paths
 /// 3. Build directed adjacency graph per highway
 /// 4. Detect connected components (separates EB/WB carriageways)
 /// 5. Walk directed edges between stop nodes to create compressed edges
 /// 6. Compute cardinal direction per component
 /// 7. Write edges into `highway_edges` and corridor entries into `exit_corridors`
-pub async fn build_graph(pool: &PgPool) -> Result<usize, anyhow::Error> {
+pub async fn build_graph(
+    pool: &PgPool,
+    interstate_relation_cache: Option<&Path>,
+) -> Result<usize, anyhow::Error> {
+    let relation_refs_by_way = if let Some(path) = interstate_relation_cache {
+        let refs = load_relation_refs_by_way(path)?;
+        tracing::info!(
+            "Loaded Interstate relation memberships for {} way ids",
+            refs.len()
+        );
+        refs
+    } else {
+        HashMap::new()
+    };
+
     tracing::info!("Loading highways from osm2pgsql_v2_highways...");
-    let highways = load_highways(pool).await?;
+    let highways = load_highways(pool, &relation_refs_by_way).await?;
     tracing::info!("Loaded {} highway ways", highways.len());
 
     tracing::info!("Loading exits from osm2pgsql_v2_exits_nodes...");
@@ -50,9 +69,9 @@ pub async fn build_graph(pool: &PgPool) -> Result<usize, anyhow::Error> {
         sqlx::query(
             "INSERT INTO highway_edges \
              (id, highway, component, start_node, end_node, length_m, \
-              geom, min_lat, max_lat, min_lon, max_lon, polyline_json, direction) \
+              geom, min_lat, max_lat, min_lon, max_lon, polyline_json, source_way_ids_json, direction) \
              VALUES ($1, $2, $3, $4, $5, $6, \
-              ST_GeomFromText($7, 4326), $8, $9, $10, $11, $12, $13) \
+              ST_GeomFromText($7, 4326), $8, $9, $10, $11, $12, $13, $14) \
              ON CONFLICT (id) DO NOTHING",
         )
         .bind(&edge.id)
@@ -67,6 +86,7 @@ pub async fn build_graph(pool: &PgPool) -> Result<usize, anyhow::Error> {
         .bind(edge.min_lon)
         .bind(edge.max_lon)
         .bind(&edge.polyline_json)
+        .bind(&edge.source_way_ids_json)
         .bind(&edge.direction)
         .execute(&mut *tx)
         .await?;
@@ -117,58 +137,69 @@ pub async fn build_graph(pool: &PgPool) -> Result<usize, anyhow::Error> {
 type HighwayRow = (
     i64,            // way_id
     String,         // highway type
-    Option<String>, // ref
+    Option<String>, // ref / int_ref
     Option<String>, // oneway
     Vec<i64>,       // node_ids
     String,         // geom as GeoJSON
 );
 
-async fn load_highways(pool: &PgPool) -> Result<Vec<ParsedHighway>, anyhow::Error> {
-    let rows: Vec<HighwayRow> = sqlx::query_as(
-        "SELECT way_id, highway, ref, oneway, node_ids, \
-         ST_AsGeoJSON(geom)::text \
-         FROM osm2pgsql_v2_highways \
-         WHERE highway IN ('motorway', 'trunk') \
-           AND node_ids IS NOT NULL \
-           AND array_length(node_ids, 1) >= 2 \
-           AND ( \
-             highway = 'motorway' \
-             OR COALESCE(NULLIF(BTRIM(ref), ''), NULLIF(BTRIM(tags ->> 'ref'), '')) IS NOT NULL \
-           )",
-    )
-    .fetch_all(pool)
-    .await?;
+async fn load_highways(
+    pool: &PgPool,
+    relation_refs_by_way: &HashMap<i64, Vec<String>>,
+) -> Result<Vec<ParsedHighway>, anyhow::Error> {
+    let relation_way_ids: Vec<i64> = relation_refs_by_way.keys().copied().collect();
+    let rows: Vec<HighwayRow> = if relation_way_ids.is_empty() {
+        sqlx::query_as(
+            "SELECT way_id, highway, \
+                    NULLIF(TRIM(BOTH ';' FROM CONCAT_WS(';', NULLIF(BTRIM(ref), ''), NULLIF(BTRIM(tags ->> 'int_ref'), ''))), '') AS ref_text, \
+                    oneway, node_ids, \
+             ST_AsGeoJSON(geom)::text \
+             FROM osm2pgsql_v2_highways \
+             WHERE highway IN ('motorway', 'motorway_link', 'trunk', 'trunk_link') \
+               AND node_ids IS NOT NULL \
+               AND array_length(node_ids, 1) >= 2",
+        )
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT way_id, highway, \
+                    NULLIF(TRIM(BOTH ';' FROM CONCAT_WS(';', NULLIF(BTRIM(ref), ''), NULLIF(BTRIM(tags ->> 'int_ref'), ''))), '') AS ref_text, \
+                    oneway, node_ids, \
+             ST_AsGeoJSON(geom)::text \
+             FROM osm2pgsql_v2_highways \
+             WHERE (highway IN ('motorway', 'motorway_link', 'trunk', 'trunk_link') \
+                    OR way_id = ANY($1)) \
+               AND node_ids IS NOT NULL \
+               AND array_length(node_ids, 1) >= 2",
+        )
+        .bind(&relation_way_ids)
+        .fetch_all(pool)
+        .await?
+    };
 
     let mut highways = Vec::with_capacity(rows.len());
     for row in rows {
-        let (_way_id, highway_type, ref_raw, oneway_raw, node_ids, geojson) = row;
+        let (way_id, highway_type, ref_raw, oneway_raw, node_ids, geojson) = row;
 
-        // NOTE: Do NOT add motorway_link here. Ref'd motorway_links at
-        // interchanges bridge EB/WB carriageways, creating merged components
-        // that the directional split shatters into many fragments. Instead,
-        // use corridor-level bridge merge on non-terminal nodes (corridors.rs).
-        let refs: Vec<String> = if highway_type == "motorway" || highway_type == "trunk" {
-            ref_raw
-                .as_deref()
-                .unwrap_or("")
-                .split(';')
-                .filter_map(|r| normalize_highway_ref(r.trim()))
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut refs: Vec<String> = ref_raw
+            .as_deref()
+            .unwrap_or("")
+            .split(';')
+            .filter_map(|r| normalize_highway_ref(r.trim()))
+            .collect();
+        if let Some(relation_refs) = relation_refs_by_way.get(&way_id) {
+            refs.extend(relation_refs.iter().cloned());
+        }
+        refs.sort();
+        refs.dedup();
         let has_interstate_ref = refs
             .iter()
             .any(|reference| is_interstate_highway_ref(reference));
-        let has_explicit_ref = ref_raw
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
+        let has_explicit_ref = !refs.is_empty();
 
-        match highway_type.as_str() {
-            "motorway" if !has_interstate_ref && has_explicit_ref => continue,
-            "trunk" if !has_interstate_ref => continue,
-            _ => {}
+        if !has_interstate_ref && has_explicit_ref {
+            continue;
         }
 
         let geometry = parse_geojson_coords(&geojson);
@@ -190,6 +221,7 @@ async fn load_highways(pool: &PgPool) -> Result<Vec<ParsedHighway>, anyhow::Erro
         }
 
         highways.push(ParsedHighway {
+            way_id,
             refs,
             nodes,
             geometry: geom,

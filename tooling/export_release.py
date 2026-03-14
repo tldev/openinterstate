@@ -5,6 +5,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -21,6 +22,7 @@ import psycopg
 INTERSTATE_FILTER = r"^(?:I-?[0-9]+|I-?35[EW]|I-?69[CEW])$"
 INTERSTATE_NAME_RE = re.compile(INTERSTATE_FILTER)
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+ROUTE_GAP_BREAK_METERS = 10_000
 
 
 @dataclass(frozen=True)
@@ -199,22 +201,111 @@ def write_checksums(
             writer.writerow([sha256_file(file_path, hash_cache), file_path.relative_to(output_path.parent).as_posix()])
 
 
+def distance_meters(a: list[float], b: list[float]) -> float:
+    lat1, lon1 = a
+    lat2, lon2 = b
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    hav = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
+    )
+    return 2 * 6_371_000 * math.asin(min(1.0, math.sqrt(hav)))
+
+
+def split_route_waypoints(
+    waypoints: list[list[float]], gap_meters: float = ROUTE_GAP_BREAK_METERS
+) -> list[list[list[float]]]:
+    if len(waypoints) < 2:
+        return []
+
+    segments: list[list[list[float]]] = []
+    current = [waypoints[0]]
+
+    for point in waypoints[1:]:
+        if distance_meters(current[-1], point) > gap_meters:
+            if len(current) >= 2:
+                segments.append(current)
+            current = [point]
+            continue
+        current.append(point)
+
+    if len(current) >= 2:
+        segments.append(current)
+
+    return segments
+
+
+def is_waypoint_pair(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) >= 2
+        and isinstance(value[0], (int, float))
+        and isinstance(value[1], (int, float))
+    )
+
+
+def route_waypoint_segments(route: dict[str, Any]) -> list[list[list[float]]]:
+    raw = json.loads(route["waypoints_json"])
+    if not isinstance(raw, list) or not raw:
+        return []
+
+    if is_waypoint_pair(raw[0]):
+        waypoints = [[float(pair[0]), float(pair[1])] for pair in raw if is_waypoint_pair(pair)]
+        segments = split_route_waypoints(waypoints)
+        if not segments and len(waypoints) >= 2:
+            segments = [waypoints]
+        return segments
+
+    segments: list[list[list[float]]] = []
+    for segment in raw:
+        if not isinstance(segment, list):
+            continue
+        points = [[float(pair[0]), float(pair[1])] for pair in segment if is_waypoint_pair(pair)]
+        if len(points) >= 2:
+            segments.append(points)
+    return segments
+
+
+def route_geometry_geojson(route: dict[str, Any]) -> dict[str, Any]:
+    segments = route_waypoint_segments(route)
+
+    if len(segments) <= 1:
+        coords = [[pair[1], pair[0]] for pair in (segments[0] if segments else [])]
+        return {"type": "LineString", "coordinates": coords}
+
+    return {
+        "type": "MultiLineString",
+        "coordinates": [
+            [[pair[1], pair[0]] for pair in segment]
+            for segment in segments
+        ],
+    }
+
+
 def route_waypoints_to_gpx(route: dict[str, Any]) -> str:
-    waypoints = json.loads(route["waypoints_json"])
-    points = []
-    for idx, pair in enumerate(waypoints):
-        lat, lon = pair
-        points.append(
-            f'      <trkpt lat="{lat}" lon="{lon}"><name>{route["reference_route_id"]}-{idx}</name></trkpt>'
-        )
+    segments = route_waypoint_segments(route)
+
+    track_segments = []
+    for segment_idx, segment in enumerate(segments):
+        track_segments.append("    <trkseg>")
+        for point_idx, pair in enumerate(segment):
+            lat, lon = pair
+            track_segments.append(
+                f'      <trkpt lat="{lat}" lon="{lon}"><name>{route["reference_route_id"]}-{segment_idx}-{point_idx}</name></trkpt>'
+            )
+        track_segments.append("    </trkseg>")
+
     display_name = route["display_name"] or route["reference_route_id"]
     return "\n".join(
         [
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<gpx version="1.1" creator="OpenInterstate" xmlns="http://www.topografix.com/GPX/1/1">',
-            f"  <trk><name>{xml_escape(display_name)}</name><trkseg>",
-            *points,
-            "  </trkseg></trk>",
+            f"  <trk><name>{xml_escape(display_name)}</name>",
+            *track_segments,
+            "  </trk>",
             "</gpx>",
         ]
     )
@@ -312,10 +403,10 @@ def main() -> None:
                   c.highway AS interstate_name,
                   c.canonical_direction AS direction_code,
                   initcap(c.canonical_direction) AS direction_label,
-                  ST_AsGeoJSON(ST_LineMerge(ST_Collect(he.geom))) AS geometry_geojson,
+                  c.geometry_json AS geometry_geojson,
                   COUNT(he.id) AS edge_count
                 FROM corridors c
-                JOIN highway_edges he ON he.corridor_id = c.corridor_id
+                LEFT JOIN highway_edges he ON he.corridor_id = c.corridor_id
                 WHERE c.highway ~ '{INTERSTATE_FILTER}'
                 GROUP BY c.corridor_id, c.highway, c.canonical_direction
                 ORDER BY c.highway, c.canonical_direction, c.corridor_id
@@ -461,13 +552,7 @@ def main() -> None:
 
             if spec.name == "reference_routes":
                 for row in rows:
-                    waypoints = json.loads(row["waypoints_json"])
-                    row["geometry_geojson"] = json.dumps(
-                        {
-                            "type": "LineString",
-                            "coordinates": [[pair[1], pair[0]] for pair in waypoints],
-                        }
-                    )
+                    row["geometry_geojson"] = json.dumps(route_geometry_geojson(row))
                 parquet_rows = [
                     {key: value for key, value in row.items() if key != "waypoints_json"} for row in rows
                 ]
