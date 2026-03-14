@@ -83,7 +83,8 @@ jobs:
           tooling/ci/prefilter_stream.sh \
             --source-url "${{ steps.meta.outputs.source_url }}" \
             --output-pbf "$PWD/ci-inputs/${{ steps.meta.outputs.filtered_filename }}" \
-            --source-metadata-file "$PWD/ci-inputs/source-pbf-metadata.json"
+            --source-metadata-file "$PWD/ci-inputs/source-pbf-metadata.json" \
+            --interstate-relation-cache-file "$PWD/ci-inputs/interstate-relations.tsv"
 
       - name: Upload filtered build inputs
         uses: actions/upload-artifact@v4
@@ -92,6 +93,7 @@ jobs:
           path: |
             ci-inputs/${{ steps.meta.outputs.filtered_filename }}
             ci-inputs/source-pbf-metadata.json
+            ci-inputs/interstate-relations.tsv
           retention-days: 1
           compression-level: 0
 
@@ -138,6 +140,7 @@ jobs:
             --release-id "${{ needs.prefilter.outputs.release_id }}" \
             --filtered-pbf-file "$PWD/ci-inputs/${{ needs.prefilter.outputs.filtered_filename }}" \
             --source-pbf-metadata-file "$PWD/ci-inputs/source-pbf-metadata.json" \
+            --interstate-relation-cache-file "$PWD/ci-inputs/interstate-relations.tsv" \
             --source-url "${{ needs.prefilter.outputs.source_url }}" \
             --output-root "$PWD/ci-artifacts/releases" \
             --work-dir "$RUNNER_TEMP/openinterstate-release-build"
