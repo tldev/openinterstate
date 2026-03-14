@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 
 use openinterstate_core::geo::haversine_distance;
-use openinterstate_core::highway_ref::normalize_highway_ref;
+use openinterstate_core::highway_ref::{is_interstate_highway_ref, normalize_highway_ref};
 use sqlx::PgPool;
 
 use crate::interstate_relations::{
@@ -1341,14 +1341,43 @@ fn allowed_refs_for_route(
     assigned_way_ids: &BTreeSet<i64>,
     ways_by_id: &HashMap<i64, RouteWay>,
 ) -> HashSet<String> {
+    let route_family = interstate_family_key(route_highway);
     let mut allowed_refs = HashSet::from([route_highway.to_string()]);
     for way_id in assigned_way_ids {
         let Some(way) = ways_by_id.get(way_id) else {
             continue;
         };
-        allowed_refs.extend(way.refs.iter().cloned());
+        for reference in &way.refs {
+            if interstate_ref_allowed_for_route(reference, route_family.as_deref()) {
+                allowed_refs.insert(reference.clone());
+            }
+        }
     }
     allowed_refs
+}
+
+fn interstate_family_key(reference: &str) -> Option<String> {
+    let normalized = normalize_highway_ref(reference)?;
+    let interstate = normalized.strip_prefix("I-")?;
+    let digits: String = interstate
+        .chars()
+        .take_while(|char| char.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
+fn interstate_ref_allowed_for_route(reference: &str, route_family: Option<&str>) -> bool {
+    if !is_interstate_highway_ref(reference) {
+        return true;
+    }
+    match route_family {
+        Some(family) => interstate_family_key(reference).as_deref() == Some(family),
+        None => false,
+    }
 }
 
 fn connector_way_allowed_for_refs(
@@ -1541,6 +1570,43 @@ mod tests {
         assert!(allowed_refs.contains("I-99"));
         assert!(allowed_refs.contains("US-220"));
         assert!(allowed_refs.contains("US-15"));
+    }
+
+    #[test]
+    fn route_policy_excludes_foreign_interstate_refs() {
+        let ways_by_id = HashMap::from([
+            (
+                50_i64,
+                route_way(
+                    50,
+                    &["I-35", "I-29", "US-71"],
+                    &[1, 2],
+                    &[(39.12, -94.58), (39.13, -94.58)],
+                    "motorway",
+                    true,
+                ),
+            ),
+            (
+                51_i64,
+                route_way(
+                    51,
+                    &["I-35E", "MN-61"],
+                    &[3, 4],
+                    &[(44.95, -93.09), (44.96, -93.08)],
+                    "motorway",
+                    true,
+                ),
+            ),
+        ]);
+        let assigned = BTreeSet::from([50_i64, 51_i64]);
+
+        let allowed_refs = allowed_refs_for_route("I-35", &assigned, &ways_by_id);
+
+        assert!(allowed_refs.contains("I-35"));
+        assert!(allowed_refs.contains("I-35E"));
+        assert!(allowed_refs.contains("US-71"));
+        assert!(allowed_refs.contains("MN-61"));
+        assert!(!allowed_refs.contains("I-29"));
     }
 
     #[test]
