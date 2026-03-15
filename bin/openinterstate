@@ -10,23 +10,23 @@ ENV_FILE="$DEFAULT_ENV_FILE"
 usage() {
   cat <<'USAGE'
 Usage:
-  bin/openinterstate [--env-file /abs/path/.env] [--data-dir /abs/path] [--release-dir /abs/path] <command> [args]
+  bin/openinterstate [--env-file /abs/path/.env] [--data-parent /abs/path] [--data-dir /abs/workspace] [--release-dir /abs/path] <command> [args]
 
 Commands:
   build            Download or use a source PBF, import it, derive data, and export a release
   publish          Publish a built release to GitHub
 
-One-command local run:
-  ./bin/openinterstate build
+Default hash-addressed workspace:
+  ./bin/openinterstate --data-parent /Volumes/goose-drive/openinterstate build
 
-External data volume:
-  ./bin/openinterstate --data-dir /Volumes/goose-drive/openinterstate-data build
-
-External data volume with explicit release output:
+Explicit release output:
   ./bin/openinterstate \
-    --data-dir /Volumes/goose-drive/openinterstate-data \
-    --release-dir /Volumes/goose-drive/openinterstate-releases \
+    --data-parent /Volumes/goose-drive/openinterstate \
+    --release-dir /Volumes/goose-drive/openinterstate/releases \
     build
+
+Explicit workspace override:
+  ./bin/openinterstate --data-dir /Volumes/goose-drive/openinterstate/workspaces/pbf-sha256/<sha256> build
 USAGE
 }
 
@@ -40,6 +40,11 @@ while [[ $# -gt 0 ]]; do
     --data-dir)
       [[ $# -ge 3 ]] || { usage; exit 1; }
       export OI_DATA_ROOT="$2"
+      shift 2
+      ;;
+    --data-parent)
+      [[ $# -ge 3 ]] || { usage; exit 1; }
+      export OI_DATA_PARENT="$2"
       shift 2
       ;;
     --release-dir)
@@ -64,7 +69,7 @@ shift || true
 oi_require_cmd docker
 oi_load_env "$ENV_FILE"
 oi_set_defaults
-oi_prepare_dirs
+oi_prepare_parent_dirs
 oi_compose_cmd "$ENV_FILE"
 
 case "$COMMAND" in
@@ -73,7 +78,8 @@ case "$COMMAND" in
     PBF_URL=""
     SOURCE_URL=""
     RELEASE_ID="release-$(date +%F)"
-    OUTPUT_ROOT="$OI_RELEASE_DIR"
+    OUTPUT_ROOT=""
+    OUTPUT_ROOT_IS_EXPLICIT=false
     PREFILTER=true
     FORCE_PREFILTER=false
 
@@ -97,10 +103,12 @@ case "$COMMAND" in
           ;;
         --output-root)
           OUTPUT_ROOT="$2"
+          OUTPUT_ROOT_IS_EXPLICIT=true
           shift 2
           ;;
         --release-dir)
           OUTPUT_ROOT="$2"
+          OUTPUT_ROOT_IS_EXPLICIT=true
           shift 2
           ;;
         --skip-prefilter)
@@ -136,6 +144,19 @@ case "$COMMAND" in
       fi
     fi
 
+    if [[ "$OI_DATA_ROOT_IS_EXPLICIT" == true ]]; then
+      oi_prepare_dirs
+    else
+      PBF_FILE="$(oi_abs_path "$PBF_FILE")"
+      oi_activate_workspace_for_source_pbf "$PBF_FILE" "$SOURCE_URL" || exit $?
+    fi
+
+    if [[ "$OUTPUT_ROOT_IS_EXPLICIT" == true ]]; then
+      OUTPUT_ROOT="$(oi_managed_path "$OUTPUT_ROOT")"
+    else
+      OUTPUT_ROOT="$OI_RELEASE_DIR"
+    fi
+
     oi_db_up
     oi_wait_for_db
 
@@ -149,19 +170,32 @@ case "$COMMAND" in
     ;;
   publish)
     RELEASE_ID=""
-    OUTPUT_ROOT="$OI_RELEASE_DIR"
+    OUTPUT_ROOT=""
+    OUTPUT_ROOT_IS_EXPLICIT=false
+    PBF_FILE=""
+    PBF_URL=""
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --release-id)
           RELEASE_ID="$2"
           shift 2
           ;;
+        --pbf-file)
+          PBF_FILE="$2"
+          shift 2
+          ;;
+        --pbf-url)
+          PBF_URL="$2"
+          shift 2
+          ;;
         --output-root)
           OUTPUT_ROOT="$2"
+          OUTPUT_ROOT_IS_EXPLICIT=true
           shift 2
           ;;
         --release-dir)
           OUTPUT_ROOT="$2"
+          OUTPUT_ROOT_IS_EXPLICIT=true
           shift 2
           ;;
         -h|--help)
@@ -173,7 +207,30 @@ case "$COMMAND" in
           ;;
       esac
     done
+
+    if [[ -n "$PBF_FILE" && -n "$PBF_URL" ]]; then
+      oi_die "choose either --pbf-file or --pbf-url"
+    fi
     [[ -n "$RELEASE_ID" ]] || oi_die "--release-id is required"
+
+    if [[ -n "$PBF_URL" ]]; then
+      PBF_FILE="$(oi_download_pbf "$PBF_URL")" || exit $?
+    fi
+
+    if [[ "$OI_DATA_ROOT_IS_EXPLICIT" == true ]]; then
+      oi_prepare_dirs
+    elif [[ "$OUTPUT_ROOT_IS_EXPLICIT" != true ]]; then
+      [[ -n "$PBF_FILE" ]] || oi_die "publish needs --pbf-file/--pbf-url, --data-dir, or --release-dir when using hash-addressed workspaces"
+      PBF_FILE="$(oi_abs_path "$PBF_FILE")"
+      oi_activate_workspace_for_source_pbf "$PBF_FILE" || exit $?
+    fi
+
+    if [[ "$OUTPUT_ROOT_IS_EXPLICIT" == true ]]; then
+      OUTPUT_ROOT="$(oi_managed_path "$OUTPUT_ROOT")"
+    else
+      OUTPUT_ROOT="$OI_RELEASE_DIR"
+    fi
+
     oi_publish_release "$RELEASE_ID" "$OUTPUT_ROOT"
     ;;
   -h|--help|help)

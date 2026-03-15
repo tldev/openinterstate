@@ -15,35 +15,34 @@ The repo is organized around one job:
 If Docker is installed, this works from a fresh clone:
 
 ```bash
-./bin/openinterstate build
+./bin/openinterstate --data-parent /Volumes/goose-drive/openinterstate build
 ```
 
 That command downloads `us-latest.osm.pbf`, starts PostGIS, imports canonical
-OSM, derives product tables, and writes a release into `.data/releases/` by
-default.
+OSM, derives product tables, and writes a release under a workspace chosen from
+the source PBF SHA-256:
 
-If your main disk is tight, move the managed data workspace onto another volume:
-
-```bash
-./bin/openinterstate --data-dir /Volumes/goose-drive/openinterstate-data build
+```text
+/Volumes/goose-drive/openinterstate/workspaces/pbf-sha256/<sha256>
 ```
 
-With that command, working data and release artifacts both land under
-`/Volumes/goose-drive/openinterstate-data/`.
-
-Runner caches now follow the managed data root too, so Cargo registry/git
-state and the Rust target directory stay on the external volume instead of
-quietly growing inside Docker-managed local storage.
+Raw source downloads are shared under
+`/Volumes/goose-drive/openinterstate/source-cache/`, and Cargo cache is shared
+under `/Volumes/goose-drive/openinterstate/cache/cargo/` so Rust builds are
+reused across PBF workspaces.
 
 If you want release artifacts in a separate folder, set an explicit release
 root:
 
 ```bash
 ./bin/openinterstate \
-  --data-dir /Volumes/goose-drive/openinterstate-data \
-  --release-dir /Volumes/goose-drive/openinterstate-releases \
+  --data-parent /Volumes/goose-drive/openinterstate \
+  --release-dir /Volumes/goose-drive/openinterstate/releases \
   build
 ```
+
+If you need to pin an exact workspace path and bypass the SHA-derived layout,
+use `--data-dir` as an explicit override.
 
 When the source PBF, import mapping, derive inputs, and release exporter are
 unchanged, repeated builds now skip the already-current stages instead of

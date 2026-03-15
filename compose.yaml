@@ -62,6 +62,7 @@ services:
     working_dir: /workspace
     volumes:
       - ./:/workspace
+      - ${OI_DATA_PARENT:-./.data}:/managed
       - ${OI_DATA_ROOT}:/data
       - ${OI_RELEASE_DIR:-./.data/releases}:/releases
       - ${OI_CARGO_REGISTRY_DIR:-./.data/cache/cargo/registry}:/usr/local/cargo/registry
