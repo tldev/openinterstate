@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -22,6 +22,12 @@ pub struct InterstateRouteGroup {
     pub root_relation_id: i64,
     pub direction: Option<String>,
     pub members: Vec<InterstateRelationMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InterstateRouteSignature {
+    pub root_relation_id: i64,
+    pub direction: Option<String>,
 }
 
 pub fn load_interstate_relation_members(
@@ -84,11 +90,6 @@ pub fn load_interstate_relation_members(
     Ok(members)
 }
 
-pub fn load_relation_refs_by_way(path: &Path) -> Result<HashMap<i64, Vec<String>>, anyhow::Error> {
-    let members = load_interstate_relation_members(path)?;
-    Ok(relation_refs_by_way(&members))
-}
-
 pub fn relation_refs_by_way(members: &[InterstateRelationMember]) -> HashMap<i64, Vec<String>> {
     let mut refs_by_way: HashMap<i64, Vec<String>> = HashMap::new();
     for member in members {
@@ -104,6 +105,38 @@ pub fn relation_refs_by_way(members: &[InterstateRelationMember]) -> HashMap<i64
     }
 
     refs_by_way
+}
+
+pub fn route_signatures_by_highway_and_way(
+    members: &[InterstateRelationMember],
+) -> HashMap<String, HashMap<i64, Vec<InterstateRouteSignature>>> {
+    let mut signatures_by_highway_and_way: HashMap<
+        String,
+        HashMap<i64, BTreeSet<InterstateRouteSignature>>,
+    > = HashMap::new();
+
+    for member in members {
+        signatures_by_highway_and_way
+            .entry(member.highway.clone())
+            .or_default()
+            .entry(member.way_id)
+            .or_default()
+            .insert(InterstateRouteSignature {
+                root_relation_id: member.root_relation_id,
+                direction: member.direction.clone(),
+            });
+    }
+
+    signatures_by_highway_and_way
+        .into_iter()
+        .map(|(highway, signatures_by_way)| {
+            let normalized_signatures_by_way = signatures_by_way
+                .into_iter()
+                .map(|(way_id, signatures)| (way_id, signatures.into_iter().collect()))
+                .collect();
+            (highway, normalized_signatures_by_way)
+        })
+        .collect()
 }
 
 pub fn group_relation_members(members: &[InterstateRelationMember]) -> Vec<InterstateRouteGroup> {
