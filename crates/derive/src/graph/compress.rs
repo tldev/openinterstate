@@ -596,7 +596,21 @@ fn identify_stop_nodes(
     for &node_id in graph.neighbors_undirected.keys() {
         let incoming = in_degree.get(&node_id).copied().unwrap_or(0);
         let outgoing = out_degree.get(&node_id).copied().unwrap_or(0);
-        if !(incoming == 1 && outgoing == 1) {
+
+        // A simple pass-through has exactly one directed arc in and one out.
+        // A bidirectional pass-through (e.g. undivided motorway with oneway=no)
+        // has in_degree=2 and out_degree=2 where the incoming and outgoing
+        // neighbor sets are identical (arcs go both ways to the same two nodes).
+        let is_simple_passthrough = incoming == 1 && outgoing == 1;
+        let is_bidi_passthrough = incoming == 2
+            && outgoing == 2
+            && incoming_neighbors
+                .get(&node_id)
+                .zip(graph.neighbors_directed.get(&node_id))
+                .map(|(inc, out)| inc == out)
+                .unwrap_or(false);
+
+        if !is_simple_passthrough && !is_bidi_passthrough {
             stop_nodes.insert(node_id);
             continue;
         }
@@ -605,21 +619,28 @@ fn identify_stop_nodes(
             continue;
         };
 
-        let incoming_signature = incoming_neighbors
-            .get(&node_id)
-            .and_then(|neighbors| neighbors.iter().next().copied())
-            .map(|prev_node| {
-                arc_route_signature(graph, (prev_node, node_id), route_signatures_by_way)
-            });
-        let outgoing_signature = graph
-            .neighbors_directed
-            .get(&node_id)
-            .and_then(|neighbors| neighbors.iter().next().copied())
-            .map(|next_node| {
-                arc_route_signature(graph, (node_id, next_node), route_signatures_by_way)
-            });
+        // For route-signature comparison, use the two undirected neighbors.
+        // This works for both simple (1-in/1-out) and bidi (2-in/2-out) nodes:
+        // we check that the route membership on the "left" edge matches the
+        // "right" edge. For simple nodes, these are the sole incoming/outgoing
+        // arcs. For bidi nodes, picking one arc per side is sufficient since
+        // both arc directions on the same way share the same way_id set.
+        let undirected = graph.neighbors_undirected.get(&node_id);
+        let signatures_match = undirected
+            .filter(|neighbors| neighbors.len() == 2)
+            .map(|neighbors| {
+                let mut iter = neighbors.iter().copied();
+                let a = iter.next().unwrap();
+                let b = iter.next().unwrap();
+                let sig_a =
+                    arc_route_signature(graph, (a, node_id), route_signatures_by_way);
+                let sig_b =
+                    arc_route_signature(graph, (node_id, b), route_signatures_by_way);
+                sig_a == sig_b
+            })
+            .unwrap_or(false);
 
-        if incoming_signature != outgoing_signature {
+        if !signatures_match {
             stop_nodes.insert(node_id);
         }
     }
@@ -1091,5 +1112,71 @@ mod tests {
         assert_eq!(edges.len(), 2);
         assert!(edges.iter().any(|edge| edge.start_node == 1 && edge.end_node == 3));
         assert!(edges.iter().any(|edge| edge.start_node == 3 && edge.end_node == 4));
+    }
+
+    #[test]
+    fn compresses_bidirectional_chain_into_two_edges() {
+        // Simulates an undivided motorway section (oneway=no) like I-40 through
+        // the Great Smoky Mountains. Interior nodes of the bidi chain should
+        // compress, producing one forward and one reverse compressed edge rather
+        // than per-node-pair fragments in both directions.
+        let highways = vec![
+            // Oneway approach into the bidi section
+            sample_highway(
+                "way/1",
+                &["I-40"],
+                &[1, 2],
+                &[(35.0, -83.2), (35.001, -83.19)],
+            ),
+            // Bidirectional section (3 ways, 4 interior nodes)
+            sample_highway_kind(
+                "way/2",
+                "motorway",
+                &["I-40"],
+                &[2, 3, 4],
+                &[(35.001, -83.19), (35.002, -83.18), (35.003, -83.17)],
+                false,
+            ),
+            sample_highway_kind(
+                "way/3",
+                "motorway",
+                &["I-40"],
+                &[4, 5, 6],
+                &[(35.003, -83.17), (35.004, -83.16), (35.005, -83.15)],
+                false,
+            ),
+            // Oneway exit from the bidi section
+            sample_highway(
+                "way/4",
+                &["I-40"],
+                &[6, 7],
+                &[(35.005, -83.15), (35.006, -83.14)],
+            ),
+        ];
+
+        let (edges, _) = compress_highway_graph(&highways, &[], &HashMap::new());
+
+        let i40: Vec<&CompressedEdge> =
+            edges.iter().filter(|e| e.highway == "I-40").collect();
+
+        // Without the bidi fix this would produce many per-arc fragment edges.
+        // With the fix: approach (1->2), forward bidi (2->6), reverse bidi (6->2), exit (6->7) = 4 edges.
+        assert_eq!(
+            i40.len(),
+            4,
+            "expected 4 compressed edges (approach + bidi fwd + bidi rev + exit), got {}: {:?}",
+            i40.len(),
+            i40.iter()
+                .map(|e| format!("{}->{}", e.start_node, e.end_node))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            i40.iter().any(|e| e.start_node == 2 && e.end_node == 6),
+            "missing forward compressed bidi edge 2->6"
+        );
+        assert!(
+            i40.iter().any(|e| e.start_node == 6 && e.end_node == 2),
+            "missing reverse compressed bidi edge 6->2"
+        );
     }
 }
