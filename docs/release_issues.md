@@ -62,9 +62,19 @@ These corridors have a POI-per-exit ratio well below the release average of ~5.2
 | I-530     |    45 |   49 |      1.09 |
 | I-587     |    49 |   30 |      0.61 |
 
-- I-335 (short Kansas stub) and I-269 (Mississippi) may be genuinely sparse, but zero/near-zero is still suspicious.
-- I-73 is the most concerning: 106 exits with only 21 POI links is almost certainly a place-linking gap, not a real absence of services along a 100+ mile corridor in NC/VA.
-- I-840, I-155, I-165 warrant a spot-check against OSM POI density in those areas.
+### ~~I-73~~ WON'T FIX — not a bug
+
+Investigated via Overpass and local PostGIS. OSM has plenty of POIs near I-73
+(e.g. 44 within 1,500m of Exit 102 in Greensboro), but zero I-73 exits have a
+POI within the 800m linking radius. The nearest POI to Exit 102 is 808m away.
+I-73's exit nodes sit on the mainline carriageway and commercial clusters are
+consistently 1–3km down the exit ramps — the geometry just doesn't fit the 800m
+radius that works for most interstates. Widening the radius globally or adding
+per-exit adaptive linking is a design-level change, not a targeted fix.
+
+### Remaining
+
+- I-335, I-269, I-155, I-165, I-840, I-530, I-587 have not been investigated.
 
 ---
 
