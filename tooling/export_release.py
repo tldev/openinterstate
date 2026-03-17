@@ -366,34 +366,8 @@ def build_manifest(
     }
 
 
-def main() -> None:
-    args = parse_args()
-    output_dir = Path(args.output_dir).resolve()
-    state_dir = Path(args.state_dir).resolve() if args.state_dir else None
-    csv_dir, gpx_dir, examples_dir = ensure_dirs(output_dir)
-    source_pbf_path = Path(args.source_pbf_file).resolve() if args.source_pbf_file else None
-    import_pbf_path = Path(args.import_pbf_file).resolve() if args.import_pbf_file else source_pbf_path
-    hash_cache: dict[tuple[str, int, int], str] = {}
-
-    if source_pbf_path is not None:
-        source_pbf_metadata = build_source_file_metadata(source_pbf_path, state_dir, hash_cache)
-    else:
-        source_pbf_metadata = load_source_file_metadata(Path(args.source_pbf_metadata_file).resolve(), "source_pbf")
-    assert import_pbf_path is not None
-    import_pbf_metadata = build_source_file_metadata(import_pbf_path, state_dir, hash_cache)
-
-    source_lineage = {
-        "source_url": args.source_url,
-        "source_pbf": source_pbf_metadata,
-        "import_pbf": import_pbf_metadata,
-        "derivation": [
-            "osm2pgsql flex import via schema/osm2pgsql/openinterstate.lua",
-            "schema/derive.sql",
-            "openinterstate-derive graph, corridor, and reference-route builders",
-        ],
-    }
-
-    specs = [
+def build_export_specs(interstate_filter: str = INTERSTATE_FILTER) -> list[ExportSpec]:
+    return [
         ExportSpec(
             name="corridors",
             filename="corridors.csv",
@@ -407,7 +381,7 @@ def main() -> None:
                   COUNT(he.id) AS edge_count
                 FROM corridors c
                 LEFT JOIN highway_edges he ON he.corridor_id = c.corridor_id
-                WHERE c.highway ~ '{INTERSTATE_FILTER}'
+                WHERE c.highway ~ '{interstate_filter}'
                 GROUP BY c.corridor_id, c.highway, c.canonical_direction
                 ORDER BY c.highway, c.canonical_direction, c.corridor_id
             """,
@@ -420,12 +394,12 @@ def main() -> None:
                   he.id AS edge_id,
                   he.corridor_id,
                   c.highway AS interstate_name,
-                  he.direction AS direction_code,
+                  c.canonical_direction AS direction_code,
                   he.length_m,
                   ST_AsGeoJSON(he.geom) AS geometry_geojson
                 FROM highway_edges he
                 JOIN corridors c ON c.corridor_id = he.corridor_id
-                WHERE c.highway ~ '{INTERSTATE_FILTER}'
+                WHERE c.highway ~ '{interstate_filter}'
                 ORDER BY he.corridor_id, he.id
             """,
         ),
@@ -446,7 +420,7 @@ def main() -> None:
                   json_build_object('type', 'Point', 'coordinates', json_build_array(ce.lon, ce.lat))::text AS geometry_geojson
                 FROM corridor_exits ce
                 JOIN corridors c USING (corridor_id)
-                WHERE c.highway ~ '{INTERSTATE_FILTER}'
+                WHERE c.highway ~ '{interstate_filter}'
                 ORDER BY c.highway, c.canonical_direction, ce.corridor_index
             """,
         ),
@@ -477,7 +451,7 @@ def main() -> None:
                 JOIN exit_poi_candidates epc ON epc.poi_id = p.id
                 JOIN corridor_exits ce ON ce.exit_id = epc.exit_id
                 JOIN corridors c USING (corridor_id)
-                WHERE c.highway ~ '{INTERSTATE_FILTER}'
+                WHERE c.highway ~ '{interstate_filter}'
                 ORDER BY p.id
             """,
         ),
@@ -494,7 +468,7 @@ def main() -> None:
                 FROM exit_poi_candidates epc
                 JOIN corridor_exits ce ON ce.exit_id = epc.exit_id
                 JOIN corridors c USING (corridor_id)
-                WHERE c.highway ~ '{INTERSTATE_FILTER}'
+                WHERE c.highway ~ '{interstate_filter}'
                 ORDER BY epc.exit_id, epc.poi_id
             """,
         ),
@@ -516,7 +490,7 @@ def main() -> None:
                 FROM exit_poi_reachability epr
                 JOIN corridor_exits ce ON ce.exit_id = epr.exit_id
                 JOIN corridors c USING (corridor_id)
-                WHERE c.highway ~ '{INTERSTATE_FILTER}'
+                WHERE c.highway ~ '{interstate_filter}'
                 ORDER BY epr.exit_id, epr.poi_id
             """,
         ),
@@ -535,11 +509,41 @@ def main() -> None:
                   point_count,
                   waypoints_json
                 FROM reference_routes
-                WHERE highway ~ '{INTERSTATE_FILTER}'
+                WHERE highway ~ '{interstate_filter}'
                 ORDER BY highway, direction_code, display_name
             """,
         ),
     ]
+
+
+def main() -> None:
+    args = parse_args()
+    output_dir = Path(args.output_dir).resolve()
+    state_dir = Path(args.state_dir).resolve() if args.state_dir else None
+    csv_dir, gpx_dir, examples_dir = ensure_dirs(output_dir)
+    source_pbf_path = Path(args.source_pbf_file).resolve() if args.source_pbf_file else None
+    import_pbf_path = Path(args.import_pbf_file).resolve() if args.import_pbf_file else source_pbf_path
+    hash_cache: dict[tuple[str, int, int], str] = {}
+
+    if source_pbf_path is not None:
+        source_pbf_metadata = build_source_file_metadata(source_pbf_path, state_dir, hash_cache)
+    else:
+        source_pbf_metadata = load_source_file_metadata(Path(args.source_pbf_metadata_file).resolve(), "source_pbf")
+    assert import_pbf_path is not None
+    import_pbf_metadata = build_source_file_metadata(import_pbf_path, state_dir, hash_cache)
+
+    source_lineage = {
+        "source_url": args.source_url,
+        "source_pbf": source_pbf_metadata,
+        "import_pbf": import_pbf_metadata,
+        "derivation": [
+            "osm2pgsql flex import via schema/osm2pgsql/openinterstate.lua",
+            "schema/derive.sql",
+            "openinterstate-derive graph, corridor, and reference-route builders",
+        ],
+    }
+
+    specs = build_export_specs()
 
     row_counts: dict[str, int] = {}
     written_files: list[Path] = []

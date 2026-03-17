@@ -5,6 +5,7 @@ use openinterstate_core::geo::haversine_distance;
 use openinterstate_core::highway_ref::is_interstate_highway_ref;
 
 use crate::canonical_types::{ParsedExit, ParsedHighway};
+use crate::interstate_relations::InterstateRouteSignature;
 
 use super::directions::compute_component_directions;
 
@@ -44,6 +45,8 @@ struct HighwayGraph {
     arc_way_ids: HashMap<(i64, i64), BTreeSet<i64>>,
 }
 
+type RouteSignaturesByWay = HashMap<i64, Vec<InterstateRouteSignature>>;
+
 struct ConnectorGraph {
     adjacency: HashMap<i64, Vec<ConnectorArc>>,
 }
@@ -80,6 +83,7 @@ impl PartialOrd for SearchState {
 pub(super) fn compress_highway_graph(
     highways: &[ParsedHighway],
     exits: &[ParsedExit],
+    route_signatures_by_highway_and_way: &HashMap<String, RouteSignaturesByWay>,
 ) -> (Vec<CompressedEdge>, Vec<ExitCorridorEntry>) {
     let (all_exit_node_ids, exit_id_by_node) = build_exit_node_index(exits);
     let ways_by_highway = group_ways_by_highway(highways);
@@ -97,14 +101,21 @@ pub(super) fn compress_highway_graph(
         let Some(graph) = build_highway_graph(highway_ways) else {
             continue;
         };
+        let route_signatures_by_way = route_signatures_by_highway_and_way.get(&highway);
 
         let component_by_node = compute_components(&graph.neighbors_undirected);
         let stop_nodes = identify_stop_nodes(
-            &graph.neighbors_undirected,
-            &graph.neighbors_directed,
+            &graph,
             &all_exit_node_ids,
+            route_signatures_by_way,
         );
-        let mut edges = walk_compressed_edges(&highway, &graph, &component_by_node, &stop_nodes);
+        let mut edges = walk_compressed_edges(
+            &highway,
+            &graph,
+            &component_by_node,
+            &stop_nodes,
+            route_signatures_by_way,
+        );
 
         let component_directions = compute_component_directions(&edges, &highway);
         apply_component_directions(&mut edges, &component_directions);
@@ -565,31 +576,56 @@ fn compute_components(neighbors_undirected: &HashMap<i64, BTreeSet<i64>>) -> Has
 }
 
 fn identify_stop_nodes(
-    neighbors_undirected: &HashMap<i64, BTreeSet<i64>>,
-    neighbors_directed: &HashMap<i64, BTreeSet<i64>>,
+    graph: &HighwayGraph,
     all_exit_node_ids: &HashSet<i64>,
+    route_signatures_by_way: Option<&RouteSignaturesByWay>,
 ) -> HashSet<i64> {
     let mut stop_nodes: HashSet<i64> = HashSet::new();
     let mut in_degree: HashMap<i64, usize> = HashMap::new();
     let mut out_degree: HashMap<i64, usize> = HashMap::new();
+    let mut incoming_neighbors: HashMap<i64, BTreeSet<i64>> = HashMap::new();
 
-    for (&node, targets) in neighbors_directed {
+    for (&node, targets) in &graph.neighbors_directed {
         *out_degree.entry(node).or_default() += targets.len();
         for &target in targets {
             *in_degree.entry(target).or_default() += 1;
+            incoming_neighbors.entry(target).or_default().insert(node);
         }
     }
 
-    for &node_id in neighbors_undirected.keys() {
+    for &node_id in graph.neighbors_undirected.keys() {
         let incoming = in_degree.get(&node_id).copied().unwrap_or(0);
         let outgoing = out_degree.get(&node_id).copied().unwrap_or(0);
         if !(incoming == 1 && outgoing == 1) {
+            stop_nodes.insert(node_id);
+            continue;
+        }
+
+        let Some(route_signatures_by_way) = route_signatures_by_way else {
+            continue;
+        };
+
+        let incoming_signature = incoming_neighbors
+            .get(&node_id)
+            .and_then(|neighbors| neighbors.iter().next().copied())
+            .map(|prev_node| {
+                arc_route_signature(graph, (prev_node, node_id), route_signatures_by_way)
+            });
+        let outgoing_signature = graph
+            .neighbors_directed
+            .get(&node_id)
+            .and_then(|neighbors| neighbors.iter().next().copied())
+            .map(|next_node| {
+                arc_route_signature(graph, (node_id, next_node), route_signatures_by_way)
+            });
+
+        if incoming_signature != outgoing_signature {
             stop_nodes.insert(node_id);
         }
     }
 
     for &node_id in all_exit_node_ids {
-        if neighbors_undirected.contains_key(&node_id) {
+        if graph.neighbors_undirected.contains_key(&node_id) {
             stop_nodes.insert(node_id);
         }
     }
@@ -602,6 +638,7 @@ fn walk_compressed_edges(
     graph: &HighwayGraph,
     component_by_node: &HashMap<i64, i32>,
     stop_nodes: &HashSet<i64>,
+    route_signatures_by_way: Option<&RouteSignaturesByWay>,
 ) -> Vec<CompressedEdge> {
     let mut edges = Vec::new();
     let mut visited_directed: HashSet<(i64, i64)> = HashSet::new();
@@ -635,6 +672,9 @@ fn walk_compressed_edges(
                 .get(&first_edge)
                 .cloned()
                 .unwrap_or_default();
+            let route_signature = route_signatures_by_way.map(|memberships| {
+                arc_route_signature(graph, first_edge, memberships)
+            });
             visited_directed.insert(first_edge);
 
             let mut prev = start_node;
@@ -663,6 +703,16 @@ fn walk_compressed_edges(
                 let next_edge = (cur, next);
                 if visited_directed.contains(&next_edge) {
                     break;
+                }
+
+                if let (Some(route_signatures_by_way), Some(route_signature)) =
+                    (route_signatures_by_way, route_signature.as_ref())
+                {
+                    let next_signature =
+                        arc_route_signature(graph, next_edge, route_signatures_by_way);
+                    if next_signature != *route_signature {
+                        break;
+                    }
                 }
 
                 polyline.push(next_coord);
@@ -723,6 +773,22 @@ fn walk_compressed_edges(
     }
 
     edges
+}
+
+fn arc_route_signature(
+    graph: &HighwayGraph,
+    arc: (i64, i64),
+    route_signatures_by_way: &RouteSignaturesByWay,
+) -> Vec<InterstateRouteSignature> {
+    let mut signature: BTreeSet<InterstateRouteSignature> = BTreeSet::new();
+
+    for way_id in graph.arc_way_ids.get(&arc).into_iter().flatten() {
+        if let Some(route_signatures) = route_signatures_by_way.get(way_id) {
+            signature.extend(route_signatures.iter().cloned());
+        }
+    }
+
+    signature.into_iter().collect()
 }
 
 fn bounds_for_polyline(polyline: &[(f64, f64)]) -> (f64, f64, f64, f64) {
@@ -804,6 +870,7 @@ fn build_corridor_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interstate_relations::InterstateRouteSignature;
 
     fn sample_exit(id: &str, osm_id: i64) -> ParsedExit {
         ParsedExit {
@@ -843,6 +910,16 @@ mod tests {
         }
     }
 
+    fn sample_route_signature(
+        root_relation_id: i64,
+        direction: Option<&str>,
+    ) -> InterstateRouteSignature {
+        InterstateRouteSignature {
+            root_relation_id,
+            direction: direction.map(|value| value.to_string()),
+        }
+    }
+
     #[test]
     fn compresses_highway_and_assigns_corridor_entry() {
         let highways = vec![sample_highway(
@@ -853,7 +930,8 @@ mod tests {
         )];
         let exits = vec![sample_exit("node/2", 2)];
 
-        let (edges, corridor_entries) = compress_highway_graph(&highways, &exits);
+        let (edges, corridor_entries) =
+            compress_highway_graph(&highways, &exits, &HashMap::new());
 
         assert_eq!(
             edges.len(),
@@ -885,7 +963,7 @@ mod tests {
             ),
         ];
 
-        let (edges, _) = compress_highway_graph(&highways, &[]);
+        let (edges, _) = compress_highway_graph(&highways, &[], &HashMap::new());
         let edge_low = edges
             .iter()
             .find(|edge| edge.start_node == 1 && edge.end_node == 2)
@@ -916,7 +994,8 @@ mod tests {
             ),
         ];
 
-        let (edges, corridor_entries) = compress_highway_graph(&highways, &[]);
+        let (edges, corridor_entries) =
+            compress_highway_graph(&highways, &[], &HashMap::new());
 
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].highway, "I-280");
@@ -948,7 +1027,7 @@ mod tests {
             ),
         ];
 
-        let (edges, _) = compress_highway_graph(&highways, &[]);
+        let (edges, _) = compress_highway_graph(&highways, &[], &HashMap::new());
 
         let i95_edges: Vec<&CompressedEdge> =
             edges.iter().filter(|edge| edge.highway == "I-95").collect();
@@ -961,5 +1040,56 @@ mod tests {
         assert!(i95_edges
             .iter()
             .any(|edge| edge.start_node == 1 && edge.end_node == 4));
+    }
+
+    #[test]
+    fn splits_edges_when_route_membership_signature_changes_mid_chain() {
+        let highways = vec![
+            sample_highway(
+                "way/1",
+                &["I-19"],
+                &[1, 2],
+                &[(31.0, -110.0), (31.001, -110.0)],
+            ),
+            sample_highway(
+                "way/2",
+                &["I-19"],
+                &[2, 3],
+                &[(31.001, -110.0), (31.002, -110.0)],
+            ),
+            sample_highway(
+                "way/3",
+                &["I-19"],
+                &[3, 4],
+                &[(31.002, -110.0), (31.003, -110.0)],
+            ),
+        ];
+        let route_signatures_by_highway_and_way = HashMap::from([(
+            "I-19".to_string(),
+            HashMap::from([
+                (
+                    1,
+                    vec![sample_route_signature(2369468, Some("north"))],
+                ),
+                (
+                    2,
+                    vec![sample_route_signature(2369468, Some("north"))],
+                ),
+                (
+                    3,
+                    vec![sample_route_signature(2369468, Some("south"))],
+                ),
+            ]),
+        )]);
+
+        let (edges, _) = compress_highway_graph(
+            &highways,
+            &[],
+            &route_signatures_by_highway_and_way,
+        );
+
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().any(|edge| edge.start_node == 1 && edge.end_node == 3));
+        assert!(edges.iter().any(|edge| edge.start_node == 3 && edge.end_node == 4));
     }
 }

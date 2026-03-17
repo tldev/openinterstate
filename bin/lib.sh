@@ -46,6 +46,15 @@ oi_hash_files() {
   fi
 }
 
+oi_hash_file_sha256() {
+  local path="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+  else
+    sha256sum "$path" | awk '{print $1}'
+  fi
+}
+
 oi_file_signature() {
   local path="$1"
   if stat -c '%n|%s|%Y' "$path" >/dev/null 2>&1; then
@@ -152,7 +161,53 @@ oi_load_env() {
   done
 }
 
+oi_export_path_vars() {
+  export OI_DATA_PARENT OI_SOURCE_CACHE_DIR OI_INDEX_DIR OI_PARENT_CACHE_DIR OI_WORKSPACES_DIR
+  export OI_DATA_ROOT OI_POSTGRES_DIR OI_FLATNODES_DIR OI_DOWNLOAD_DIR OI_FILTERED_DIR
+  export OI_STATE_DIR OI_CACHE_DIR OI_CARGO_REGISTRY_DIR OI_CARGO_GIT_DIR OI_CARGO_TARGET_DIR
+  export OI_RELEASE_DIR OI_BUILD_DIR OI_PBF_SHA256
+}
+
+oi_configure_data_root() {
+  local data_root="$1"
+  local release_root
+
+  OI_DATA_ROOT="$(oi_abs_path "$data_root")"
+  OI_POSTGRES_DIR="$(oi_abs_path "$OI_DATA_ROOT/postgres/db")"
+  OI_FLATNODES_DIR="$(oi_abs_path "$OI_DATA_ROOT/flatnodes")"
+  OI_DOWNLOAD_DIR="$(oi_abs_path "$OI_DATA_ROOT/downloads")"
+  OI_FILTERED_DIR="$(oi_abs_path "$OI_DATA_ROOT/filtered")"
+  OI_STATE_DIR="$(oi_abs_path "$OI_DATA_ROOT/state")"
+  OI_CACHE_DIR="$(oi_abs_path "$OI_DATA_ROOT/cache")"
+
+  if [[ "$OI_RELEASE_DIR_IS_EXPLICIT" == true ]]; then
+    release_root="$OI_RELEASE_DIR"
+  elif [[ "$OI_BUILD_DIR_IS_EXPLICIT" == true ]]; then
+    release_root="$OI_BUILD_DIR"
+  else
+    release_root="$OI_DATA_ROOT/releases"
+  fi
+  OI_RELEASE_DIR="$(oi_abs_path "$release_root")"
+  OI_BUILD_DIR="$OI_RELEASE_DIR"
+
+  oi_export_path_vars
+}
+
 oi_set_defaults() {
+  local data_root_was_set=false
+  local release_dir_was_set=false
+  local build_dir_was_set=false
+
+  if [[ -n "${OI_DATA_ROOT+x}" ]]; then
+    data_root_was_set=true
+  fi
+  if [[ -n "${OI_RELEASE_DIR+x}" ]]; then
+    release_dir_was_set=true
+  fi
+  if [[ -n "${OI_BUILD_DIR+x}" ]]; then
+    build_dir_was_set=true
+  fi
+
   OI_DB_PORT="${OI_DB_PORT:-5434}"
   OI_DEFAULT_US_PBF_URL="${OI_DEFAULT_US_PBF_URL:-https://download.geofabrik.de/north-america/us-latest.osm.pbf}"
   OSM2PGSQL_MODE="${OSM2PGSQL_MODE:-auto}"
@@ -170,26 +225,52 @@ oi_set_defaults() {
   OI_DB_CONTAINER_PORT="${OI_DB_CONTAINER_PORT:-5432}"
   PRODUCT_DB_URL="${PRODUCT_DB_URL:-postgres://${OI_DB_USER}:${OI_DB_PASSWORD}@${OI_DB_HOST}:${OI_DB_CONTAINER_PORT}/${OI_DB_NAME}}"
 
-  OI_DATA_ROOT="$(oi_abs_path "${OI_DATA_ROOT:-$REPO_ROOT/.data}")"
-  OI_POSTGRES_DIR="$(oi_abs_path "${OI_POSTGRES_DIR:-$OI_DATA_ROOT/postgres/db}")"
-  OI_FLATNODES_DIR="$(oi_abs_path "${OI_FLATNODES_DIR:-$OI_DATA_ROOT/flatnodes}")"
-  OI_DOWNLOAD_DIR="$(oi_abs_path "${OI_DOWNLOAD_DIR:-$OI_DATA_ROOT/downloads}")"
-  OI_FILTERED_DIR="$(oi_abs_path "${OI_FILTERED_DIR:-$OI_DATA_ROOT/filtered}")"
-  OI_STATE_DIR="$(oi_abs_path "${OI_STATE_DIR:-$OI_DATA_ROOT/state}")"
-  OI_CACHE_DIR="$(oi_abs_path "${OI_CACHE_DIR:-$OI_DATA_ROOT/cache}")"
-  OI_CARGO_REGISTRY_DIR="$(oi_abs_path "${OI_CARGO_REGISTRY_DIR:-$OI_CACHE_DIR/cargo/registry}")"
-  OI_CARGO_GIT_DIR="$(oi_abs_path "${OI_CARGO_GIT_DIR:-$OI_CACHE_DIR/cargo/git}")"
-  OI_CARGO_TARGET_DIR="$(oi_abs_path "${OI_CARGO_TARGET_DIR:-$OI_CACHE_DIR/cargo/target}")"
-  OI_RELEASE_DIR="$(oi_abs_path "${OI_RELEASE_DIR:-${OI_BUILD_DIR:-$OI_DATA_ROOT/releases}}")"
-  OI_BUILD_DIR="$OI_RELEASE_DIR"
+  OI_DATA_ROOT_IS_EXPLICIT="$data_root_was_set"
+  OI_RELEASE_DIR_IS_EXPLICIT="$release_dir_was_set"
+  OI_BUILD_DIR_IS_EXPLICIT="$build_dir_was_set"
+  if [[ "$OI_DATA_ROOT_IS_EXPLICIT" == true ]]; then
+    OI_DATA_PARENT="$(oi_abs_path "${OI_DATA_PARENT:-$OI_DATA_ROOT}")"
+  else
+    OI_DATA_PARENT="$(oi_abs_path "${OI_DATA_PARENT:-/Volumes/goose-drive/openinterstate}")"
+  fi
+  OI_SOURCE_CACHE_DIR="$(oi_abs_path "${OI_SOURCE_CACHE_DIR:-$OI_DATA_PARENT/source-cache}")"
+  OI_INDEX_DIR="$(oi_abs_path "${OI_INDEX_DIR:-$OI_DATA_PARENT/index}")"
+  OI_PARENT_CACHE_DIR="$(oi_abs_path "${OI_PARENT_CACHE_DIR:-$OI_DATA_PARENT/cache}")"
+  OI_WORKSPACES_DIR="$(oi_abs_path "${OI_WORKSPACES_DIR:-$OI_DATA_PARENT/workspaces/pbf-sha256}")"
+  OI_PBF_SHA256="${OI_PBF_SHA256:-}"
+  OI_CARGO_REGISTRY_DIR="$(oi_abs_path "${OI_CARGO_REGISTRY_DIR:-$OI_PARENT_CACHE_DIR/cargo/registry}")"
+  OI_CARGO_GIT_DIR="$(oi_abs_path "${OI_CARGO_GIT_DIR:-$OI_PARENT_CACHE_DIR/cargo/git}")"
+  OI_CARGO_TARGET_DIR="$(oi_abs_path "${OI_CARGO_TARGET_DIR:-$OI_PARENT_CACHE_DIR/cargo/target}")"
+
+  if [[ "$OI_DATA_ROOT_IS_EXPLICIT" == true ]]; then
+    oi_configure_data_root "$OI_DATA_ROOT"
+  else
+    oi_configure_data_root "$OI_DATA_PARENT"
+  fi
 
   export OI_DB_PORT
-  export OI_DATA_ROOT OI_POSTGRES_DIR OI_FLATNODES_DIR OI_DOWNLOAD_DIR OI_FILTERED_DIR
-  export OI_STATE_DIR OI_CACHE_DIR OI_CARGO_REGISTRY_DIR OI_CARGO_GIT_DIR OI_CARGO_TARGET_DIR
-  export OI_RELEASE_DIR OI_BUILD_DIR OI_FLATNODES_MODE OI_FLATNODES_AUTO_MAX_PBF_MB OI_IMPORT_CACHE_MB
+  export OI_DATA_ROOT_IS_EXPLICIT OI_RELEASE_DIR_IS_EXPLICIT OI_BUILD_DIR_IS_EXPLICIT
+  export OI_FLATNODES_MODE OI_FLATNODES_AUTO_MAX_PBF_MB OI_IMPORT_CACHE_MB
+}
+
+oi_prepare_parent_dirs() {
+  mkdir -p \
+    "$OI_DATA_PARENT" \
+    "$OI_SOURCE_CACHE_DIR" \
+    "$OI_INDEX_DIR" \
+    "$OI_PARENT_CACHE_DIR" \
+    "$OI_WORKSPACES_DIR" \
+    "$OI_CARGO_REGISTRY_DIR" \
+    "$OI_CARGO_GIT_DIR" \
+    "$OI_CARGO_TARGET_DIR"
+
+  if [[ "$OI_RELEASE_DIR_IS_EXPLICIT" == true ]]; then
+    mkdir -p "$OI_RELEASE_DIR"
+  fi
 }
 
 oi_prepare_dirs() {
+  oi_prepare_parent_dirs
   mkdir -p \
     "$OI_DATA_ROOT" \
     "$OI_POSTGRES_DIR" \
@@ -278,22 +359,115 @@ oi_path_is_in_data_root() {
   oi_path_is_under "$1" "$OI_DATA_ROOT"
 }
 
+oi_path_is_in_data_parent() {
+  oi_path_is_under "$1" "$OI_DATA_PARENT"
+}
+
 oi_path_is_in_release_root() {
   oi_path_is_under "$1" "$OI_RELEASE_DIR"
 }
 
 oi_path_is_managed() {
   local path="$1"
-  oi_path_is_in_repo "$path" || oi_path_is_in_data_root "$path" || oi_path_is_in_release_root "$path"
+  oi_path_is_in_repo "$path" || oi_path_is_in_data_root "$path" || oi_path_is_in_data_parent "$path" || oi_path_is_in_release_root "$path"
 }
 
 oi_managed_path() {
   local path
   path="$(oi_abs_path "$1")"
   if ! oi_path_is_managed "$path"; then
-    oi_die "path must live inside the repository or data directory: $path"
+    oi_die "path must live inside the repository or managed data parent: $path"
   fi
   printf '%s\n' "$path"
+}
+
+oi_parent_state_file() {
+  local scope="$1"
+  local key="$2"
+  printf '%s/%s-%s.state\n' "$OI_INDEX_DIR" "$scope" "$(oi_hash_text "$key")"
+}
+
+oi_source_pbf_sha256() {
+  local source_pbf="$1"
+  local abs_source signature state_file cached_signature cached_sha256
+
+  abs_source="$(oi_abs_path "$source_pbf")"
+  [[ -f "$abs_source" ]] || oi_die "source PBF not found: $abs_source"
+
+  signature="$(oi_file_signature "$abs_source")"
+  state_file="$(oi_parent_state_file pbf-sha256 "$signature")"
+  cached_signature="$(oi_state_read "$state_file" signature 2>/dev/null || true)"
+  cached_sha256="$(oi_state_read "$state_file" sha256 2>/dev/null || true)"
+  if [[ "$cached_signature" == "$signature" && ${#cached_sha256} -eq 64 ]]; then
+    printf '%s\n' "$cached_sha256"
+    return 0
+  fi
+
+  oi_log "Hashing source PBF to select workspace"
+  echo "  source: $abs_source" >&2
+  cached_sha256="$(oi_hash_file_sha256 "$abs_source")"
+  oi_state_write "$state_file" \
+    signature "$signature" \
+    source_pbf "$abs_source" \
+    sha256 "$cached_sha256" \
+    completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf '%s\n' "$cached_sha256"
+}
+
+oi_workspace_root_for_sha256() {
+  local sha256="$1"
+  printf '%s/%s\n' "$OI_WORKSPACES_DIR" "$sha256"
+}
+
+oi_json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  printf '%s' "$value"
+}
+
+oi_write_workspace_metadata() {
+  local source_pbf="$1"
+  local source_url="${2:-}"
+  local metadata_file="$OI_DATA_ROOT/workspace.json"
+  local metadata_tmp="${metadata_file}.tmp.$$"
+
+  mkdir -p "$OI_DATA_ROOT"
+  {
+    printf '{\n'
+    printf '  "layout": "pbf-sha256",\n'
+    printf '  "pbf_sha256": "%s",\n' "$(oi_json_escape "$OI_PBF_SHA256")"
+    printf '  "data_parent": "%s",\n' "$(oi_json_escape "$OI_DATA_PARENT")"
+    printf '  "workspace_root": "%s",\n' "$(oi_json_escape "$OI_DATA_ROOT")"
+    printf '  "release_root": "%s",\n' "$(oi_json_escape "$OI_RELEASE_DIR")"
+    printf '  "source_pbf": "%s"' "$(oi_json_escape "$source_pbf")"
+    if [[ -n "$source_url" ]]; then
+      printf ',\n  "source_url": "%s"\n' "$(oi_json_escape "$source_url")"
+    else
+      printf '\n'
+    fi
+    printf '}\n'
+  } > "$metadata_tmp"
+  mv "$metadata_tmp" "$metadata_file"
+}
+
+oi_activate_workspace_for_source_pbf() {
+  local source_pbf="$1"
+  local source_url="${2:-}"
+  local abs_source source_sha workspace_root
+
+  abs_source="$(oi_abs_path "$source_pbf")"
+  [[ -f "$abs_source" ]] || oi_die "source PBF not found: $abs_source"
+
+  # A given source PBF always resolves to the same workspace path.
+  source_sha="$(oi_source_pbf_sha256 "$abs_source")"
+  workspace_root="$(oi_workspace_root_for_sha256 "$source_sha")"
+
+  OI_PBF_SHA256="$source_sha"
+  oi_configure_data_root "$workspace_root"
+  oi_prepare_dirs
+  oi_write_workspace_metadata "$abs_source" "$source_url"
 }
 
 oi_stage_input_file() {
@@ -349,6 +523,23 @@ oi_container_path() {
     return 0
   fi
 
+  if oi_path_is_in_data_root "$host_path"; then
+    rel_path="${host_path#$OI_DATA_ROOT/}"
+    printf '/data/%s\n' "$rel_path"
+    return 0
+  fi
+
+  if [[ "$host_path" == "$OI_DATA_PARENT" ]]; then
+    printf '/managed\n'
+    return 0
+  fi
+
+  if oi_path_is_in_data_parent "$host_path"; then
+    rel_path="${host_path#$OI_DATA_PARENT/}"
+    printf '/managed/%s\n' "$rel_path"
+    return 0
+  fi
+
   rel_path="${host_path#$OI_DATA_ROOT/}"
   printf '/data/%s\n' "$rel_path"
 }
@@ -375,7 +566,7 @@ oi_download_pbf() {
   local -a curl_args=()
 
   if [[ -z "$output_path" ]]; then
-    resolved_output="$OI_DOWNLOAD_DIR/$(basename "$source_url")"
+    resolved_output="$OI_SOURCE_CACHE_DIR/$(basename "$source_url")"
   else
     resolved_output="$(oi_managed_path "$output_path")"
   fi
@@ -396,7 +587,7 @@ oi_download_pbf() {
     curl_args+=(-z "$(oi_container_path "$resolved_output")")
   fi
 
-  oi_runner curl "${curl_args[@]}" "$source_url" -o "$(oi_container_path "$resolved_output")" || return $?
+  oi_runner curl "${curl_args[@]}" "$source_url" -o "$(oi_container_path "$resolved_output")" >&2 || return $?
   printf '%s\n' "$resolved_output"
 }
 
@@ -472,7 +663,7 @@ oi_filter_pbf() {
     "$(oi_container_path "$input_pbf")" \
     "${filter_args[@]}" \
     --overwrite \
-    -o "$(oi_container_path "$output_tmp")" || return $?
+    -o "$(oi_container_path "$output_tmp")" >&2 || return $?
 
   mv "$output_tmp" "$output_pbf"
   oi_state_write "$state_file" \
@@ -578,9 +769,10 @@ oi_import_canonical() {
   local source_pbf="$1"
   local prefilter="${2:-true}"
   local force_prefilter="${3:-false}"
-  local import_pbf pbf_basename pbf_stem filtered_output import_mode
+  local import_pbf pbf_basename pbf_stem filtered_output import_mode requested_mode signature_mode
   local flatnodes_path drop_middle mapping_file
-  local import_state_file import_signature import_size_bytes
+  local import_state_file import_signature import_size_bytes stored_signature
+  local legacy_create_signature="" legacy_append_signature=""
   local use_flatnodes=false flatnodes_mode threshold_bytes
   local cache_mb
   local -a osm2pgsql_args=()
@@ -601,6 +793,7 @@ oi_import_canonical() {
     import_pbf="$(oi_filter_pbf "$source_pbf" "$filtered_output" "$force_prefilter")"
   fi
 
+  requested_mode="${OSM2PGSQL_MODE:-auto}"
   import_mode="$(oi_resolve_import_mode)"
   if [[ "$import_mode" == "append" ]]; then
     if oi_canonical_db_updatable; then
@@ -630,16 +823,43 @@ oi_import_canonical() {
   import_size_bytes="$(oi_file_size_bytes "$import_pbf")"
   threshold_bytes=$(( ${OI_FLATNODES_AUTO_MAX_PBF_MB:-1024} * 1024 * 1024 ))
   import_state_file="$(oi_state_file import "$OI_DATA_ROOT|$OI_DB_NAME")"
+  signature_mode="$import_mode"
+  if [[ "$requested_mode" == "auto" ]]; then
+    signature_mode="auto"
+  fi
   import_signature="$(
     {
       oi_file_signature "$import_pbf"
       printf 'mapping=%s\n' "$(oi_hash_files "$mapping_file")"
-      printf 'mode=%s\n' "$import_mode"
+      printf 'mode=%s\n' "$signature_mode"
       printf 'drop_middle=%s\n' "$drop_middle"
       printf 'flatnodes_mode=%s\n' "$flatnodes_mode"
       printf 'cache_mb=%s\n' "$cache_mb"
     } | oi_hash_stdin
   )"
+  stored_signature="$(oi_state_read "$import_state_file" signature 2>/dev/null || true)"
+  if [[ "$requested_mode" == "auto" ]]; then
+    legacy_create_signature="$(
+      {
+        oi_file_signature "$import_pbf"
+        printf 'mapping=%s\n' "$(oi_hash_files "$mapping_file")"
+        printf 'mode=create\n'
+        printf 'drop_middle=%s\n' "$drop_middle"
+        printf 'flatnodes_mode=%s\n' "$flatnodes_mode"
+        printf 'cache_mb=%s\n' "$cache_mb"
+      } | oi_hash_stdin
+    )"
+    legacy_append_signature="$(
+      {
+        oi_file_signature "$import_pbf"
+        printf 'mapping=%s\n' "$(oi_hash_files "$mapping_file")"
+        printf 'mode=append\n'
+        printf 'drop_middle=%s\n' "$drop_middle"
+        printf 'flatnodes_mode=%s\n' "$flatnodes_mode"
+        printf 'cache_mb=%s\n' "$cache_mb"
+      } | oi_hash_stdin
+    )"
+  fi
 
   case "$flatnodes_mode" in
     always)
@@ -662,10 +882,24 @@ oi_import_canonical() {
     oi_cleanup_unused_flatnodes "$flatnodes_path"
   fi
 
-  if oi_canonical_tables_exist && [[ "$(oi_state_read "$import_state_file" signature 2>/dev/null || true)" == "$import_signature" ]]; then
+  if oi_canonical_tables_exist && {
+    [[ "$stored_signature" == "$import_signature" ]] || {
+      [[ "$requested_mode" == "auto" ]] && {
+        [[ "$stored_signature" == "$legacy_create_signature" ]] || [[ "$stored_signature" == "$legacy_append_signature" ]]
+      }
+    }
+  }; then
     oi_assert_canonical_import_ready
     oi_log "Skipping canonical osm2pgsql import; input and mapping are unchanged"
     echo "  input: $import_pbf" >&2
+    oi_state_write "$import_state_file" \
+      signature "$import_signature" \
+      source_pbf "$source_pbf" \
+      import_pbf "$import_pbf" \
+      mode "$import_mode" \
+      requested_mode "$requested_mode" \
+      use_flatnodes "$use_flatnodes" \
+      completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf '%s\n' "$import_pbf"
     return 0
   fi
@@ -709,13 +943,14 @@ oi_import_canonical() {
   fi
 
   oi_runner env PGPASSWORD="$OI_DB_PASSWORD" \
-    osm2pgsql "${osm2pgsql_args[@]}" "$(oi_container_path "$import_pbf")" || return $?
+    osm2pgsql "${osm2pgsql_args[@]}" "$(oi_container_path "$import_pbf")" >&2 || return $?
   oi_assert_canonical_import_ready
   oi_state_write "$import_state_file" \
     signature "$import_signature" \
     source_pbf "$source_pbf" \
     import_pbf "$import_pbf" \
     mode "$import_mode" \
+    requested_mode "$requested_mode" \
     use_flatnodes "$use_flatnodes" \
     completed_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
@@ -729,7 +964,9 @@ oi_extract_interstate_relation_cache() {
   import_state_file="$(oi_state_file import "$OI_DATA_ROOT|$OI_DB_NAME")"
   source_pbf="$(oi_state_read "$import_state_file" source_pbf 2>/dev/null || true)"
   if [[ -z "$source_pbf" || ! -f "$source_pbf" ]]; then
-    if [[ -f "$OI_DOWNLOAD_DIR/us-latest.osm.pbf" ]]; then
+    if [[ -f "$OI_SOURCE_CACHE_DIR/us-latest.osm.pbf" ]]; then
+      source_pbf="$OI_SOURCE_CACHE_DIR/us-latest.osm.pbf"
+    elif [[ -f "$OI_DOWNLOAD_DIR/us-latest.osm.pbf" ]]; then
       source_pbf="$OI_DOWNLOAD_DIR/us-latest.osm.pbf"
     else
       oi_die "cannot extract Interstate relation cache: source PBF is unavailable"

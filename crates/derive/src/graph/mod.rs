@@ -10,7 +10,9 @@ use openinterstate_core::highway_ref::{is_interstate_highway_ref, normalize_high
 use sqlx::PgPool;
 
 use crate::canonical_types::{ParsedExit, ParsedHighway};
-use crate::interstate_relations::load_relation_refs_by_way;
+use crate::interstate_relations::{
+    load_interstate_relation_members, relation_refs_by_way, route_signatures_by_highway_and_way,
+};
 
 use component_ids::stabilize_component_ids;
 use compress::compress_highway_graph;
@@ -29,7 +31,10 @@ pub async fn build_graph(
     pool: &PgPool,
     interstate_relation_cache: &Path,
 ) -> Result<usize, anyhow::Error> {
-    let relation_refs_by_way = load_relation_refs_by_way(interstate_relation_cache)?;
+    let relation_members = load_interstate_relation_members(interstate_relation_cache)?;
+    let relation_refs_by_way = relation_refs_by_way(&relation_members);
+    let route_signatures_by_highway_and_way =
+        route_signatures_by_highway_and_way(&relation_members);
     tracing::info!(
         "Loaded Interstate relation memberships for {} way ids",
         relation_refs_by_way.len()
@@ -48,7 +53,11 @@ pub async fn build_graph(
         .execute(pool)
         .await?;
 
-    let (mut edges, mut corridor_entries) = compress_highway_graph(&highways, &exits);
+    let (mut edges, mut corridor_entries) = compress_highway_graph(
+        &highways,
+        &exits,
+        &route_signatures_by_highway_and_way,
+    );
     stabilize_component_ids(pool, &mut edges, &mut corridor_entries).await?;
 
     tracing::info!(

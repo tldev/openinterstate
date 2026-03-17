@@ -26,25 +26,34 @@ Optional on the host:
 
 1. `gh` if you want to publish a release to GitHub from your machine
 
-If local disk is constrained, put the managed data workspace on another volume:
+The default local layout uses a parent data root and derives a per-PBF
+workspace from the source file SHA-256:
 
 ```bash
-./bin/openinterstate --data-dir /Volumes/goose-drive/openinterstate-data build
+./bin/openinterstate --data-parent /Volumes/goose-drive/openinterstate build
 ```
 
-If you want release artifacts in a separate directory, set an explicit release
-root:
+That resolves the working workspace to:
+
+```text
+/Volumes/goose-drive/openinterstate/workspaces/pbf-sha256/<sha256>
+```
+
+Shared raw source downloads live under
+`/Volumes/goose-drive/openinterstate/source-cache/`, and shared Cargo cache
+lives under `/Volumes/goose-drive/openinterstate/cache/cargo/`.
+
+If you want release artifacts in a separate directory, set an explicit release root:
 
 ```bash
 ./bin/openinterstate \
-  --data-dir /Volumes/goose-drive/openinterstate-data \
-  --release-dir /Volumes/goose-drive/openinterstate-releases \
+  --data-parent /Volumes/goose-drive/openinterstate \
+  --release-dir /Volumes/goose-drive/openinterstate/releases \
   build
 ```
 
-Cargo and runner caches now default under the managed data root as well, so a
-goose-drive workspace keeps both data artifacts and Rust build cache off the
-main disk.
+If you need to bypass the SHA-derived layout, use `--data-dir` to pin an exact
+workspace path explicitly.
 
 ## GitHub Actions Workflow
 
@@ -68,21 +77,22 @@ test extract so release-workflow changes can be validated quickly in PRs.
 
 ## Environment Setup
 
-The default local workflow works without any env file and stores working data in
-repo-local `.data/`, with release artifacts written to `.data/releases/`.
+The default local workflow works without any env file and uses the goose-drive
+parent root `/Volumes/goose-drive/openinterstate`. Each source PBF resolves to
+its own workspace under `workspaces/pbf-sha256/<sha256>`.
 
 If you want to override the defaults, copy `.env.example` to `.env` and update:
 
 1. the exposed Postgres host port
-2. the managed data workspace root
-3. the release output root
+2. the managed parent data root
+3. the optional explicit workspace or release output root
 4. the default Geofabrik source URL
 5. canonical import safety flags
 
 ## One-Command Build
 
 ```bash
-./bin/openinterstate build
+./bin/openinterstate --data-parent /Volumes/goose-drive/openinterstate build
 ```
 
 ## Publish Step
@@ -91,6 +101,7 @@ After a successful build, publish the generated release to GitHub:
 
 ```bash
 ./bin/openinterstate publish \
+  --pbf-url https://download.geofabrik.de/north-america/us-latest.osm.pbf \
   --release-id release-$(date +%F)
 ```
 

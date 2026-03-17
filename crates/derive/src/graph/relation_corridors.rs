@@ -102,6 +102,7 @@ struct ExitRow {
 struct HighwayEdgeRow {
     edge_id: String,
     highway: String,
+    #[allow(dead_code)]
     direction: Option<String>,
     source_way_ids: Vec<i64>,
 }
@@ -200,6 +201,34 @@ fn filter_route_groups(groups: Vec<InterstateRouteGroup>) -> Vec<InterstateRoute
         .filter(|group| group.direction.is_some())
         .map(|group| (group.highway.clone(), group.root_relation_id))
         .collect();
+
+    let mut unresolved_by_root: HashMap<(String, i64), (BTreeSet<i64>, usize)> = HashMap::new();
+    for group in &groups {
+        if group.direction.is_some()
+            || !directional_roots.contains(&(group.highway.clone(), group.root_relation_id))
+        {
+            continue;
+        }
+
+        let entry = unresolved_by_root
+            .entry((group.highway.clone(), group.root_relation_id))
+            .or_insert_with(|| (BTreeSet::new(), 0));
+        entry.1 += group.members.len();
+        for member in &group.members {
+            entry.0.insert(member.leaf_relation_id);
+        }
+    }
+
+    for ((highway, root_relation_id), (leaf_relation_ids, blank_member_count)) in unresolved_by_root
+    {
+        tracing::warn!(
+            highway = %highway,
+            root_relation_id,
+            ?leaf_relation_ids,
+            blank_member_count,
+            "dropping unresolved blank relation members for directional Interstate root"
+        );
+    }
 
     groups
         .into_iter()
@@ -358,17 +387,21 @@ fn build_corridor_draft(
         return Ok(None);
     }
 
+    let allow_unassigned_interstate_connectors = group.direction.is_none();
+
     adopt_relation_connector_paths(
         &ordered_members,
         &mut assigned_way_ids,
         ways_by_id,
         connector_graph,
+        allow_unassigned_interstate_connectors,
     );
     adopt_connector_paths(
         &mut assigned_way_ids,
         ways_by_id,
         connector_graph,
         &group.highway,
+        allow_unassigned_interstate_connectors,
     );
 
     let assigned_ways: Vec<&RouteWay> = assigned_way_ids
@@ -399,7 +432,7 @@ fn build_corridor_draft(
             .collect(),
         &route_segments,
     );
-    let edge_ids = matched_edge_ids(edge_rows, &assigned_way_ids, Some(&canonical_direction));
+    let edge_ids = matched_edge_ids(edge_rows, &group.highway, &assigned_way_ids);
 
     let source_way_ids: Vec<i64> = assigned_way_ids.into_iter().collect();
     if route_segments.len() > 1 {
@@ -521,6 +554,7 @@ fn adopt_relation_connector_paths(
     assigned_way_ids: &mut BTreeSet<i64>,
     ways_by_id: &HashMap<i64, RouteWay>,
     connector_graph: &ConnectorGraph,
+    allow_unassigned_interstate_connectors: bool,
 ) {
     loop {
         let assigned_ways: Vec<&RouteWay> = assigned_way_ids
@@ -581,6 +615,8 @@ fn adopt_relation_connector_paths(
                 connector_graph,
                 ways_by_id,
                 &allowed_refs,
+                assigned_way_ids,
+                allow_unassigned_interstate_connectors,
                 false,
                 None,
             )
@@ -591,6 +627,8 @@ fn adopt_relation_connector_paths(
                     connector_graph,
                     ways_by_id,
                     &allowed_refs,
+                    assigned_way_ids,
+                    allow_unassigned_interstate_connectors,
                     true,
                     Some(SHORT_FALLBACK_CONNECTOR_MAX_COST_M),
                 )
@@ -614,6 +652,7 @@ fn adopt_connector_paths(
     ways_by_id: &HashMap<i64, RouteWay>,
     connector_graph: &ConnectorGraph,
     route_highway: &str,
+    allow_unassigned_interstate_connectors: bool,
 ) {
     let allowed_refs = allowed_refs_for_route(route_highway, assigned_way_ids, ways_by_id);
 
@@ -645,6 +684,8 @@ fn adopt_connector_paths(
                 connector_graph,
                 ways_by_id,
                 &allowed_refs,
+                assigned_way_ids,
+                allow_unassigned_interstate_connectors,
                 false,
                 None,
             )
@@ -655,6 +696,8 @@ fn adopt_connector_paths(
                     connector_graph,
                     ways_by_id,
                     &allowed_refs,
+                    assigned_way_ids,
+                    allow_unassigned_interstate_connectors,
                     true,
                     Some(SHORT_FALLBACK_CONNECTOR_MAX_COST_M),
                 )
@@ -689,6 +732,8 @@ fn shortest_connector_path_to_any(
     connector_graph: &ConnectorGraph,
     ways_by_id: &HashMap<i64, RouteWay>,
     allowed_interstate_refs: &HashSet<String>,
+    assigned_way_ids: &BTreeSet<i64>,
+    allow_unassigned_interstate_connectors: bool,
     allow_short_high_class_fallback: bool,
     max_cost_m: Option<u64>,
 ) -> Option<(u64, i32, Vec<i64>)> {
@@ -737,6 +782,8 @@ fn shortest_connector_path_to_any(
             if !connector_way_allowed_for_refs(
                 way,
                 allowed_interstate_refs,
+                assigned_way_ids,
+                allow_unassigned_interstate_connectors,
                 allow_short_high_class_fallback,
             ) {
                 continue;
@@ -1146,16 +1193,13 @@ fn closest_distance_along_route(route_points: &[([f64; 2], f64)], target: [f64; 
 
 fn matched_edge_ids(
     edge_rows: &[HighwayEdgeRow],
+    route_highway: &str,
     assigned_way_ids: &BTreeSet<i64>,
-    canonical_direction: Option<&str>,
 ) -> Vec<String> {
-    let wanted_direction = canonical_direction.and_then(normalize_direction);
     let mut edge_ids = Vec::new();
     for edge in edge_rows {
-        if let Some(direction) = &wanted_direction {
-            if edge.direction.as_deref() != Some(direction.as_str()) {
-                continue;
-            }
+        if edge.highway != route_highway {
+            continue;
         }
         if edge
             .source_way_ids
@@ -1170,10 +1214,52 @@ fn matched_edge_ids(
     edge_ids
 }
 
+fn validate_edge_claims(drafts: &[CorridorDraft]) -> Result<(), anyhow::Error> {
+    let mut claims: HashMap<String, (String, i32, String, i64)> = HashMap::new();
+    for draft in drafts {
+        for edge_id in &draft.edge_ids {
+            match claims.entry(edge_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert((
+                        draft.highway.clone(),
+                        draft.corridor_id,
+                        draft.canonical_direction.clone(),
+                        draft.root_relation_id,
+                    ));
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    let (existing_highway, existing_corridor_id, existing_direction, existing_root) =
+                        entry.get();
+                    if *existing_corridor_id == draft.corridor_id {
+                        continue;
+                    }
+                    if *existing_root == draft.root_relation_id {
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "edge claim conflict for highway {} edge {} between corridor {} (relation {}, {}) and corridor {} (relation {}, {})",
+                        existing_highway,
+                        edge_id,
+                        existing_corridor_id,
+                        existing_root,
+                        existing_direction,
+                        draft.corridor_id,
+                        draft.root_relation_id,
+                        draft.canonical_direction,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn write_corridors(
     pool: &PgPool,
     drafts: &[CorridorDraft],
 ) -> Result<BuildCorridorsStats, anyhow::Error> {
+    validate_edge_claims(drafts)?;
+
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM corridor_exits")
         .execute(&mut *tx)
@@ -1383,8 +1469,22 @@ fn interstate_ref_allowed_for_route(reference: &str, route_family: Option<&str>)
 fn connector_way_allowed_for_refs(
     way: &RouteWay,
     allowed_refs: &HashSet<String>,
+    assigned_way_ids: &BTreeSet<i64>,
+    allow_unassigned_interstate_connectors: bool,
     allow_short_high_class_fallback: bool,
 ) -> bool {
+    let has_interstate_ref = way
+        .refs
+        .iter()
+        .any(|reference| is_interstate_highway_ref(reference));
+
+    if has_interstate_ref
+        && !allow_unassigned_interstate_connectors
+        && !assigned_way_ids.contains(&way.way_id)
+    {
+        return false;
+    }
+
     way.refs.is_empty()
         || way
             .refs
@@ -1403,9 +1503,11 @@ mod tests {
 
     use super::{
         allowed_refs_for_pair, allowed_refs_for_route, build_connector_graph,
-        connector_way_allowed_for_refs, prune_micro_route_segments, shortest_connector_path_to_any,
-        RouteWay, SHORT_FALLBACK_CONNECTOR_MAX_COST_M,
+        connector_way_allowed_for_refs, filter_route_groups, prune_micro_route_segments,
+        shortest_connector_path_to_any, validate_edge_claims, HighwayEdgeRow, RouteWay,
+        SHORT_FALLBACK_CONNECTOR_MAX_COST_M,
     };
+    use crate::interstate_relations::{InterstateRelationMember, InterstateRouteGroup};
 
     fn route_way(
         way_id: i64,
@@ -1425,6 +1527,126 @@ mod tests {
         }
     }
 
+    fn route_group(
+        highway: &str,
+        root_relation_id: i64,
+        direction: Option<&str>,
+        members: &[(i64, i64)],
+    ) -> InterstateRouteGroup {
+        InterstateRouteGroup {
+            highway: highway.to_string(),
+            root_relation_id,
+            direction: direction.map(ToString::to_string),
+            members: members
+                .iter()
+                .enumerate()
+                .map(
+                    |(sequence_index, (way_id, leaf_relation_id))| InterstateRelationMember {
+                        way_id: *way_id,
+                        highway: highway.to_string(),
+                        root_relation_id,
+                        leaf_relation_id: *leaf_relation_id,
+                        direction: direction.map(ToString::to_string),
+                        role: None,
+                        sequence_index,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn filter_route_groups_drops_blank_group_when_directional_siblings_exist() {
+        let filtered = filter_route_groups(vec![
+            route_group("I-30", 100, Some("east"), &[(1, 101)]),
+            route_group("I-30", 100, None, &[(2, 102), (3, 102)]),
+            route_group("I-30", 100, Some("west"), &[(4, 103)]),
+            route_group("I-41", 200, None, &[(5, 201)]),
+        ]);
+
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered
+            .iter()
+            .any(|group| group.highway == "I-30" && group.direction.as_deref() == Some("east")));
+        assert!(filtered
+            .iter()
+            .any(|group| group.highway == "I-30" && group.direction.as_deref() == Some("west")));
+        assert!(!filtered
+            .iter()
+            .any(|group| group.highway == "I-30" && group.direction.is_none()));
+        assert!(filtered
+            .iter()
+            .any(|group| group.highway == "I-41" && group.direction.is_none()));
+    }
+
+    #[test]
+    fn filter_route_groups_keeps_blank_groups_for_undirected_roots() {
+        let filtered = filter_route_groups(vec![
+            route_group("I-84", 300, None, &[(1, 301), (2, 301)]),
+            route_group("I-84", 301, Some("east"), &[(3, 302)]),
+        ]);
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered
+            .iter()
+            .any(|group| group.root_relation_id == 300 && group.direction.is_none()));
+        assert!(filtered.iter().any(
+            |group| group.root_relation_id == 301 && group.direction.as_deref() == Some("east")
+        ));
+    }
+
+    #[test]
+    fn matched_edge_ids_ignore_edge_direction_when_way_membership_matches() {
+        let westbound_corridor = "west";
+        let edge_rows = vec![HighwayEdgeRow {
+            edge_id: "edge/I-10/1/2".to_string(),
+            highway: "I-10".to_string(),
+            direction: Some("east".to_string()),
+            source_way_ids: vec![1001, 1002],
+        }];
+        let assigned_way_ids = BTreeSet::from([1002_i64]);
+
+        let edge_ids = super::matched_edge_ids(&edge_rows, "I-10", &assigned_way_ids);
+
+        assert_eq!(westbound_corridor, "west");
+        assert_eq!(edge_ids, vec!["edge/I-10/1/2".to_string()]);
+    }
+
+    #[test]
+    fn validate_edge_claims_rejects_overlapping_corridor_assignments() {
+        let shared_edge_id = "edge/I-10/1/2".to_string();
+        let drafts = vec![
+            super::CorridorDraft {
+                corridor_id: 10,
+                highway: "I-10".to_string(),
+                canonical_direction: "west".to_string(),
+                root_relation_id: 1000,
+                geometry_json: "{\"type\":\"LineString\",\"coordinates\":[]}".to_string(),
+                source_way_ids: vec![1, 2],
+                edge_ids: vec![shared_edge_id.clone()],
+                exits: vec![],
+            },
+            super::CorridorDraft {
+                corridor_id: 11,
+                highway: "I-10".to_string(),
+                canonical_direction: "east".to_string(),
+                root_relation_id: 1001,
+                geometry_json: "{\"type\":\"LineString\",\"coordinates\":[]}".to_string(),
+                source_way_ids: vec![3, 4],
+                edge_ids: vec![shared_edge_id.clone()],
+                exits: vec![],
+            },
+        ];
+
+        let err = validate_edge_claims(&drafts).expect_err("overlap should fail loudly");
+        let message = err.to_string();
+        assert!(message.contains("edge/I-10/1/2"));
+        assert!(message.contains("corridor 10"));
+        assert!(message.contains("corridor 11"));
+        assert!(message.contains("relation 1000"));
+        assert!(message.contains("relation 1001"));
+    }
+
     #[test]
     fn connector_policy_allows_same_highway_interstate_ways() {
         let way = route_way(
@@ -1439,6 +1661,8 @@ mod tests {
         assert!(connector_way_allowed_for_refs(
             &way,
             &HashSet::from(["I-96".to_string()]),
+            &BTreeSet::new(),
+            true,
             false,
         ));
     }
@@ -1457,6 +1681,28 @@ mod tests {
         assert!(!connector_way_allowed_for_refs(
             &way,
             &HashSet::from(["I-96".to_string()]),
+            &BTreeSet::new(),
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn directional_connector_policy_rejects_unassigned_interstate_way_even_when_ref_matches() {
+        let way = route_way(
+            12,
+            &["I-69C", "US-281"],
+            &[1, 2],
+            &[(26.2, -98.2), (26.21, -98.2)],
+            "motorway",
+            true,
+        );
+
+        assert!(!connector_way_allowed_for_refs(
+            &way,
+            &HashSet::from(["I-69C".to_string(), "US-281".to_string()]),
+            &BTreeSet::new(),
+            false,
             false,
         ));
     }
@@ -1495,6 +1741,8 @@ mod tests {
         assert!(connector_way_allowed_for_refs(
             &bridge_way,
             &allowed_refs,
+            &BTreeSet::new(),
+            true,
             false,
         ));
     }
@@ -1533,6 +1781,8 @@ mod tests {
         assert!(connector_way_allowed_for_refs(
             &bridge_way,
             &allowed_refs,
+            &BTreeSet::new(),
+            true,
             false,
         ));
     }
@@ -1623,6 +1873,7 @@ mod tests {
         let graph = build_connector_graph(&[ways_by_id.get(&bridge_way.way_id).unwrap()]);
         let sources = HashSet::from([1_i64]);
         let targets = HashMap::from([(3_i64, 1_i32)]);
+        let assigned_way_ids = BTreeSet::new();
 
         let result = shortest_connector_path_to_any(
             &sources,
@@ -1630,11 +1881,72 @@ mod tests {
             &graph,
             &ways_by_id,
             &HashSet::from(["I-96".to_string()]),
+            &assigned_way_ids,
+            true,
             false,
             None,
         );
 
         assert_eq!(result.map(|(_, _, way_ids)| way_ids), Some(vec![12]));
+    }
+
+    #[test]
+    fn directional_gap_fill_rejects_same_highway_interstate_connector() {
+        let source_way = route_way(
+            1,
+            &["I-69C"],
+            &[1, 2],
+            &[(26.18, -98.23), (26.19, -98.23)],
+            "motorway",
+            true,
+        );
+        let target_way = route_way(
+            2,
+            &["I-69C"],
+            &[5, 6],
+            &[(26.22, -98.23), (26.23, -98.23)],
+            "motorway",
+            true,
+        );
+        let connector_way = route_way(
+            3,
+            &["I-69C", "US-281"],
+            &[2, 3, 4, 5],
+            &[
+                (26.19, -98.23),
+                (26.20, -98.23),
+                (26.21, -98.23),
+                (26.22, -98.23),
+            ],
+            "motorway",
+            true,
+        );
+        let ways_by_id = HashMap::from([
+            (source_way.way_id, source_way.clone()),
+            (target_way.way_id, target_way.clone()),
+            (connector_way.way_id, connector_way.clone()),
+        ]);
+        let graph = build_connector_graph(&[
+            ways_by_id.get(&source_way.way_id).unwrap(),
+            ways_by_id.get(&target_way.way_id).unwrap(),
+            ways_by_id.get(&connector_way.way_id).unwrap(),
+        ]);
+        let sources = HashSet::from([2_i64]);
+        let targets = HashMap::from([(5_i64, 0_i32)]);
+        let assigned_way_ids = BTreeSet::from([source_way.way_id, target_way.way_id]);
+
+        assert!(shortest_connector_path_to_any(
+            &sources,
+            &targets,
+            &graph,
+            &ways_by_id,
+            &HashSet::from(["I-69C".to_string(), "US-281".to_string()]),
+            &assigned_way_ids,
+            false,
+            false,
+            None,
+        )
+        .is_none());
     }
 
     #[test]
@@ -1681,6 +1993,7 @@ mod tests {
         let sources = HashSet::from([2_i64]);
         let targets = HashMap::from([(5_i64, 0_i32)]);
         let allowed_refs = HashSet::from(["I-12".to_string()]);
+        let assigned_way_ids = BTreeSet::from([source_way.way_id, target_way.way_id]);
 
         assert!(shortest_connector_path_to_any(
             &sources,
@@ -1688,6 +2001,8 @@ mod tests {
             &graph,
             &ways_by_id,
             &allowed_refs,
+            &assigned_way_ids,
+            false,
             false,
             None,
         )
@@ -1699,6 +2014,8 @@ mod tests {
             &graph,
             &ways_by_id,
             &allowed_refs,
+            &assigned_way_ids,
+            true,
             true,
             Some(SHORT_FALLBACK_CONNECTOR_MAX_COST_M),
         )
@@ -1750,6 +2067,7 @@ mod tests {
         let sources = HashSet::from([2_i64]);
         let targets = HashMap::from([(5_i64, 0_i32)]);
         let allowed_refs = HashSet::from(["I-12".to_string()]);
+        let assigned_way_ids = BTreeSet::from([source_way.way_id, target_way.way_id]);
 
         assert!(shortest_connector_path_to_any(
             &sources,
@@ -1757,6 +2075,8 @@ mod tests {
             &graph,
             &ways_by_id,
             &allowed_refs,
+            &assigned_way_ids,
+            true,
             true,
             Some(SHORT_FALLBACK_CONNECTOR_MAX_COST_M),
         )

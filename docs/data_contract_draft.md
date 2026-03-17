@@ -31,6 +31,9 @@ Draft key fields:
 
 Represents graph edges that belong to corridors.
 
+`direction_code` is the corridor's canonical direction. It is not the raw
+travel direction computed for an individual internal `highway_edges` row.
+
 Draft key fields:
 
 - `edge_id`
@@ -39,6 +42,10 @@ Draft key fields:
 - `direction_code`
 - `length_m`
 - `geometry_geojson`
+
+Internal note: `highway_edges.direction` remains derive-stage metadata, but it
+is not part of corridor membership semantics or the public corridor edge
+contract.
 
 ### corridor_exits
 
