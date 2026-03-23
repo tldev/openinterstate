@@ -522,6 +522,11 @@ fn build_corridor_draft(
         }
     }
 
+    // Discover sibling exits: if we have "100B", look for nearby "100A", "100C"
+    // in the full exit node set. Siblings share the same base number and are
+    // within 2km of an existing corridor exit.
+    let corridor_exit_rows = discover_sibling_exits(corridor_exit_rows, all_exit_nodes);
+
     // Resolve semicolon-separated refs (e.g. "143A;143B" at a gore-point node).
     // Prefer individual ramp-level nodes when they exist; only keep the
     // gore-point split as fallback for ref values with no dedicated node.
@@ -1397,6 +1402,101 @@ fn expand_nodes_with_adjacent_ways(
         }
     }
     expanded
+}
+
+/// Discover sibling exits by base number proximity. If the corridor has
+/// exit "100B", search for "100A", "100C", etc. within 2km in the full
+/// exit node set. This catches lettered sub-exits on separate ramp ways
+/// that aren't reachable through graph expansion.
+fn discover_sibling_exits(
+    exits: Vec<ExitRow>,
+    all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
+) -> Vec<ExitRow> {
+    const MAX_DISTANCE_M: f64 = 2_000.0;
+
+    // Collect base numbers and their positions from existing corridor exits
+    let mut base_positions: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+    let mut known_refs: HashSet<String> = HashSet::new();
+    let mut known_node_ids: HashSet<i64> = HashSet::new();
+    let highway = exits.first().map(|e| e.highway.clone()).unwrap_or_default();
+
+    for exit in &exits {
+        known_node_ids.insert(exit.graph_node);
+        if let Some(ref r) = exit.ref_val {
+            known_refs.insert(r.clone());
+            // Extract base number (e.g., "100" from "100B")
+            let base = r
+                .trim_end_matches(|c: char| c.is_ascii_uppercase())
+                .to_string();
+            if !base.is_empty() && base.chars().all(|c| c.is_ascii_digit()) {
+                base_positions
+                    .entry(base)
+                    .or_default()
+                    .push((exit.lat, exit.lon));
+            }
+        }
+    }
+
+    // Build index of all exit nodes by their base number
+    let mut exits_by_base: HashMap<String, Vec<(i64, &ExitNodeInfo)>> = HashMap::new();
+    for (&node_id, info) in all_exit_nodes {
+        if known_node_ids.contains(&node_id) {
+            continue;
+        }
+        if let Some(ref r) = info.ref_val {
+            let base = r
+                .trim_end_matches(|c: char| c.is_ascii_uppercase())
+                .to_string();
+            if !base.is_empty() && base.chars().all(|c| c.is_ascii_digit()) {
+                exits_by_base
+                    .entry(base)
+                    .or_default()
+                    .push((node_id, info));
+            }
+        }
+    }
+
+    let mut new_exits = Vec::new();
+    for (base, positions) in &base_positions {
+        let Some(candidates) = exits_by_base.get(base) else {
+            continue;
+        };
+        for &(node_id, info) in candidates {
+            let ref_val = info.ref_val.as_deref().unwrap_or("");
+            if known_refs.contains(ref_val) {
+                continue;
+            }
+            // Check if the candidate is within MAX_DISTANCE_M of any existing exit
+            let close_enough = positions.iter().any(|&(lat, lon)| {
+                haversine_m(lat, lon, info.lat, info.lon) < MAX_DISTANCE_M
+            });
+            if close_enough {
+                new_exits.push(ExitRow {
+                    exit_id: format!("node/{}", node_id),
+                    highway: highway.clone(),
+                    graph_node: node_id,
+                    ref_val: info.ref_val.clone(),
+                    name: info.name.clone(),
+                    lat: info.lat,
+                    lon: info.lon,
+                });
+                known_refs.insert(ref_val.to_string());
+            }
+        }
+    }
+
+    let mut result = exits;
+    result.extend(new_exits);
+    result
+}
+
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6_371_000.0_f64;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * r * a.sqrt().asin()
 }
 
 /// Split semicolon-separated exit refs (e.g. "143A;143B") into individual
