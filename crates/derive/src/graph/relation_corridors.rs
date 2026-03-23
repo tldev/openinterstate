@@ -210,39 +210,51 @@ fn filter_route_groups(groups: Vec<InterstateRouteGroup>) -> Vec<InterstateRoute
         .map(|group| (group.highway.clone(), group.root_relation_id))
         .collect();
 
-    let mut unresolved_by_root: HashMap<(String, i64), (BTreeSet<i64>, usize)> = HashMap::new();
+    // Count directional vs blank members per root to decide whether to keep blanks.
+    // If blank members vastly outnumber directional ones, the directional sub-relations
+    // are likely incomplete and the blank group is the real highway.
+    let mut directional_count_by_root: HashMap<(String, i64), usize> = HashMap::new();
+    let mut blank_count_by_root: HashMap<(String, i64), usize> = HashMap::new();
     for group in &groups {
-        if group.direction.is_some()
-            || !directional_roots.contains(&(group.highway.clone(), group.root_relation_id))
-        {
-            continue;
+        let key = (group.highway.clone(), group.root_relation_id);
+        if group.direction.is_some() {
+            *directional_count_by_root.entry(key).or_default() += group.members.len();
+        } else if directional_roots.contains(&key) {
+            *blank_count_by_root.entry(key).or_default() += group.members.len();
         }
-
-        let entry = unresolved_by_root
-            .entry((group.highway.clone(), group.root_relation_id))
-            .or_insert_with(|| (BTreeSet::new(), 0));
-        entry.1 += group.members.len();
-        for member in &group.members {
-            entry.0.insert(member.leaf_relation_id);
-        }
-    }
-
-    for ((highway, root_relation_id), (leaf_relation_ids, blank_member_count)) in unresolved_by_root
-    {
-        tracing::warn!(
-            highway = %highway,
-            root_relation_id,
-            ?leaf_relation_ids,
-            blank_member_count,
-            "dropping unresolved blank relation members for directional Interstate root"
-        );
     }
 
     groups
         .into_iter()
         .filter(|group| {
-            group.direction.is_some()
-                || !directional_roots.contains(&(group.highway.clone(), group.root_relation_id))
+            if group.direction.is_some() {
+                return true;
+            }
+            let key = (group.highway.clone(), group.root_relation_id);
+            if !directional_roots.contains(&key) {
+                return true;
+            }
+            // Keep blank group if it has more members than all directional groups combined
+            let dir_count = directional_count_by_root.get(&key).copied().unwrap_or(0);
+            let blank_count = blank_count_by_root.get(&key).copied().unwrap_or(0);
+            if blank_count > dir_count {
+                tracing::info!(
+                    highway = %group.highway,
+                    root_relation_id = group.root_relation_id,
+                    blank_count,
+                    dir_count,
+                    "keeping blank-direction group (outnumbers directional members)"
+                );
+                return true;
+            }
+            tracing::debug!(
+                highway = %group.highway,
+                root_relation_id = group.root_relation_id,
+                blank_count,
+                dir_count,
+                "dropping blank-direction group (directional members dominate)"
+            );
+            false
         })
         .collect()
 }
