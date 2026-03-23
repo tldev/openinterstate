@@ -526,6 +526,7 @@ fn build_corridor_draft(
     // Prefer individual ramp-level nodes when they exist; only keep the
     // gore-point split as fallback for ref values with no dedicated node.
     let corridor_exit_rows = resolve_semicolon_refs(corridor_exit_rows);
+    let corridor_exit_rows = expand_compound_refs(corridor_exit_rows);
 
     // Only keep exits that have at least a ref (exit number) or a name.
     // Bare motorway_junction nodes with neither are not useful to downstream
@@ -1426,6 +1427,79 @@ fn resolve_semicolon_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
                 highway: exit.highway.clone(),
                 graph_node: exit.graph_node,
                 ref_val: Some(part.to_string()),
+                name: exit.name.clone(),
+                lat: exit.lat,
+                lon: exit.lon,
+            });
+        }
+    }
+    result
+}
+
+/// Expand compound letter-range exits like "17A-B" into individual entries
+/// ("17A", "17B") while keeping the original compound form.
+fn expand_compound_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
+    let mut individual_refs: HashSet<String> = HashSet::new();
+    for exit in &exits {
+        if let Some(ref r) = exit.ref_val {
+            individual_refs.insert(r.clone());
+        }
+    }
+
+    let mut result = Vec::with_capacity(exits.len());
+    for exit in exits {
+        result.push(exit.clone());
+
+        let Some(ref ref_val) = exit.ref_val else {
+            continue;
+        };
+
+        // Match patterns like "17A-B", "17A-B-C", "17A-C"
+        let bytes = ref_val.as_bytes();
+        // Find the base number and letter range
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == 0 || i >= bytes.len() {
+            continue;
+        }
+        let base = &ref_val[..i];
+        let suffix = &ref_val[i..];
+
+        // Parse letter-dash-letter patterns: "A-B", "A-B-C", "A-C"
+        let letters: Vec<u8> = suffix
+            .split('-')
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.len() == 1 && s.as_bytes()[0].is_ascii_uppercase() {
+                    Some(s.as_bytes()[0])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if letters.len() < 2 {
+            continue;
+        }
+
+        let start = *letters.first().unwrap();
+        let end = *letters.last().unwrap();
+        if start >= end || (end - start) > 5 {
+            continue;
+        }
+
+        for c in start..=end {
+            let expanded = format!("{}{}", base, c as char);
+            if individual_refs.contains(&expanded) {
+                continue; // Already exists as a dedicated exit
+            }
+            result.push(ExitRow {
+                exit_id: format!("{}:{}", exit.exit_id, expanded),
+                highway: exit.highway.clone(),
+                graph_node: exit.graph_node,
+                ref_val: Some(expanded),
                 name: exit.name.clone(),
                 lat: exit.lat,
                 lon: exit.lon,
