@@ -24,7 +24,7 @@ const CONNECTOR_HIGHWAY_TYPES: &[&str] = &[
     "tertiary_link",
     "service",
 ];
-const MIN_ROUTE_LENGTH_M: f64 = 50_000.0;
+const MIN_ROUTE_LENGTH_M: f64 = 8_000.0;
 const SHORT_FALLBACK_CONNECTOR_MAX_COST_M: u64 = 10_000;
 const DISCONNECTED_MICRO_SEGMENT_MAX_LENGTH_M: f64 = 2_000.0;
 const DISCONNECTED_MICRO_SEGMENT_MAX_SHARE: f64 = 0.05;
@@ -197,6 +197,8 @@ pub async fn build_corridors(
         next_corridor_id += 1;
         drafts.push(draft);
     }
+
+    let drafts = dedup_conflicting_corridors(drafts);
 
     write_corridors(pool, &drafts).await
 }
@@ -1432,6 +1434,42 @@ fn validate_edge_claims(drafts: &[CorridorDraft]) -> Result<(), anyhow::Error> {
         }
     }
     Ok(())
+}
+
+/// Remove corridors that conflict on edge assignments with an earlier corridor.
+/// Corridors are processed in insertion order (by highway number, then root relation,
+/// then direction), so the first corridor for each highway claims edges first.
+fn dedup_conflicting_corridors(drafts: Vec<CorridorDraft>) -> Vec<CorridorDraft> {
+    let mut claimed_edges: HashMap<String, i64> = HashMap::new(); // edge_id -> root_relation_id
+    let mut kept = Vec::with_capacity(drafts.len());
+
+    for draft in drafts {
+        let has_conflict = draft.edge_ids.iter().any(|edge_id| {
+            claimed_edges
+                .get(edge_id)
+                .is_some_and(|&root| root != draft.root_relation_id)
+        });
+
+        if has_conflict {
+            tracing::warn!(
+                highway = %draft.highway,
+                direction = %draft.canonical_direction,
+                root_relation_id = draft.root_relation_id,
+                edge_count = draft.edge_ids.len(),
+                "dropping corridor with conflicting edge claims"
+            );
+            continue;
+        }
+
+        for edge_id in &draft.edge_ids {
+            claimed_edges
+                .entry(edge_id.clone())
+                .or_insert(draft.root_relation_id);
+        }
+        kept.push(draft);
+    }
+
+    kept
 }
 
 async fn write_corridors(

@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Evaluate OI corridor exit coverage against ground truth ground truth.
+
+Produces a single score (ground truth exact match %) and checks three hard gates:
+  1. Corridor count >= minimum (default 262)
+  2. Zero regressions against a saved baseline
+  3. cargo test must have passed (checked externally)
+
+Usage:
+    python3 tooling/eval_exit_coverage.py [--save-baseline] [--baseline PATH]
+
+Exit codes:
+    0  All gates passed
+    1  A gate failed (details printed to stderr)
+"""
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+
+PSQL = os.environ.get(
+    "PSQL_BIN", "/opt/homebrew/Cellar/libpq/18.2/bin/psql"
+)
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://osm:osm_dev@localhost:5434/osm"
+)
+GROUND_TRUTH_DB = os.environ.get(
+    "GROUND_TRUTH_DB",
+    "/Users/tjohnell/projects/pike/server/.data/ground_truth_portal.sqlite",
+)
+BASELINE_PATH = os.environ.get(
+    "EVAL_BASELINE", "tooling/.eval_baseline.json"
+)
+MIN_CORRIDORS = 262
+
+
+def query_psql(sql: str) -> str:
+    result = subprocess.run(
+        [PSQL, DATABASE_URL, "-t", "-A", "-F\t", "-c", sql],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"psql error: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    return result.stdout.strip()
+
+
+def load_ground_truth_pairs() -> set[tuple[str, str]]:
+    conn = sqlite3.connect(GROUND_TRUTH_DB)
+    rows = conn.execute(
+        """
+        SELECT DISTINCT h.display_name, e.sign_number
+        FROM exits e
+        JOIN request_exits re ON re.exit_id = e.exit_id
+        JOIN exits_requests er ON er.cache_key = re.cache_key
+        JOIN highway_in_states his ON his.highway_in_state_id = er.highway_in_state_id
+        JOIN highways h ON h.highway_id = his.highway_id
+        WHERE h.highway_type = 'Interstate'
+          AND e.sign_number IS NOT NULL AND e.sign_number != ''
+          AND h.display_name LIKE 'I-%'
+        """
+    ).fetchall()
+    conn.close()
+    return {(dn, sn.strip()) for dn, sn in rows}
+
+
+def load_oi_pairs() -> set[tuple[str, str]]:
+    raw = query_psql(
+        "SELECT c.highway, ce.ref "
+        "FROM corridor_exits ce "
+        "JOIN corridors c ON c.corridor_id = ce.corridor_id "
+        "WHERE ce.ref IS NOT NULL AND ce.ref != '' "
+        "AND c.highway LIKE 'I-%'"
+    )
+    pairs = set()
+    for line in raw.split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            pairs.add((parts[0], parts[1]))
+    return pairs
+
+
+def load_corridor_count() -> int:
+    raw = query_psql("SELECT COUNT(*) FROM corridors")
+    return int(raw)
+
+
+def load_baseline(path: str) -> set[tuple[str, str]] | None:
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    return {(pair[0], pair[1]) for pair in data["matched_pairs"]}
+
+
+def save_baseline(path: str, matched: set[tuple[str, str]], score: float):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(
+            {
+                "score": score,
+                "matched_count": len(matched),
+                "matched_pairs": sorted(matched),
+            },
+            f,
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--save-baseline",
+        action="store_true",
+        help="Save current matched pairs as the regression baseline",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=BASELINE_PATH,
+        help=f"Path to baseline file (default: {BASELINE_PATH})",
+    )
+    parser.add_argument(
+        "--min-corridors",
+        type=int,
+        default=MIN_CORRIDORS,
+        help=f"Minimum corridor count gate (default: {MIN_CORRIDORS})",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Output results as JSON"
+    )
+    args = parser.parse_args()
+
+    # Load data
+    ground_truth_pairs = load_ground_truth_pairs()
+    oi_pairs = load_oi_pairs()
+    corridor_count = load_corridor_count()
+    matched = ground_truth_pairs & oi_pairs
+
+    score = 100.0 * len(matched) / len(ground_truth_pairs) if ground_truth_pairs else 0.0
+
+    # Gate checks
+    gates_passed = True
+    gate_results = {}
+
+    # Gate 1: corridor count
+    corridor_ok = corridor_count >= args.min_corridors
+    gate_results["corridor_count"] = {
+        "passed": corridor_ok,
+        "value": corridor_count,
+        "minimum": args.min_corridors,
+    }
+    if not corridor_ok:
+        gates_passed = False
+
+    # Gate 2: regression check
+    baseline_matched = load_baseline(args.baseline)
+    if baseline_matched is not None:
+        regressions = baseline_matched - matched
+        regression_ok = len(regressions) == 0
+        gate_results["regressions"] = {
+            "passed": regression_ok,
+            "count": len(regressions),
+            "examples": sorted(regressions)[:10],
+        }
+        if not regression_ok:
+            gates_passed = False
+    else:
+        gate_results["regressions"] = {
+            "passed": True,
+            "count": 0,
+            "note": "no baseline file found, skipping regression check",
+        }
+
+    results = {
+        "score": round(score, 4),
+        "matched": len(matched),
+        "ground_truth_total": len(ground_truth_pairs),
+        "oi_total": len(oi_pairs),
+        "corridor_count": corridor_count,
+        "gates_passed": gates_passed,
+        "gates": gate_results,
+    }
+
+    if args.json:
+        print(json.dumps(results, indent=2))
+    else:
+        print(f"Score: {score:.2f}% ({len(matched)}/{len(ground_truth_pairs)})")
+        print(f"OI unique exits: {len(oi_pairs)}")
+        print(f"Corridors: {corridor_count}")
+        print(f"Gates: {'PASS' if gates_passed else 'FAIL'}")
+        for name, gate in gate_results.items():
+            status = "PASS" if gate["passed"] else "FAIL"
+            if name == "corridor_count":
+                print(f"  {name}: {status} ({gate['value']} >= {gate['minimum']})")
+            elif name == "regressions":
+                note = gate.get("note", "")
+                if note:
+                    print(f"  {name}: {status} ({note})")
+                else:
+                    print(f"  {name}: {status} ({gate['count']} regressions)")
+                    if gate["count"] > 0:
+                        for pair in gate["examples"]:
+                            print(f"    lost: {pair[0]} {pair[1]}")
+
+    if args.save_baseline:
+        save_baseline(args.baseline, matched, score)
+        if not args.json:
+            print(f"\nBaseline saved to {args.baseline} ({len(matched)} pairs)")
+
+    sys.exit(0 if gates_passed else 1)
+
+
+if __name__ == "__main__":
+    main()
