@@ -527,6 +527,7 @@ fn build_corridor_draft(
     // gore-point split as fallback for ref values with no dedicated node.
     let corridor_exit_rows = resolve_semicolon_refs(corridor_exit_rows);
     let corridor_exit_rows = expand_compound_refs(corridor_exit_rows);
+    let corridor_exit_rows = expand_comma_refs(corridor_exit_rows);
 
     // Only keep exits that have at least a ref (exit number) or a name.
     // Bare motorway_junction nodes with neither are not useful to downstream
@@ -1484,9 +1485,15 @@ fn expand_compound_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
             continue;
         }
 
-        let start = *letters.first().unwrap();
-        let end = *letters.last().unwrap();
-        if start >= end || (end - start) > 5 {
+        let first = *letters.first().unwrap();
+        let last = *letters.last().unwrap();
+        // Support both "A-B" and reverse "B-A" ordering
+        let (start, end) = if first <= last {
+            (first, last)
+        } else {
+            (last, first)
+        };
+        if (end - start) > 5 {
             continue;
         }
 
@@ -1494,6 +1501,72 @@ fn expand_compound_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
             let expanded = format!("{}{}", base, c as char);
             if individual_refs.contains(&expanded) {
                 continue; // Already exists as a dedicated exit
+            }
+            result.push(ExitRow {
+                exit_id: format!("{}:{}", exit.exit_id, expanded),
+                highway: exit.highway.clone(),
+                graph_node: exit.graph_node,
+                ref_val: Some(expanded),
+                name: exit.name.clone(),
+                lat: exit.lat,
+                lon: exit.lon,
+            });
+        }
+    }
+    result
+}
+
+/// Expand comma-separated exit refs like "11A,B" into "11A" and "11B",
+/// and "12A,12B" into individual entries. Keeps the original compound form.
+fn expand_comma_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
+    let mut individual_refs: HashSet<String> = HashSet::new();
+    for exit in &exits {
+        if let Some(ref r) = exit.ref_val {
+            if !r.contains(',') {
+                individual_refs.insert(r.clone());
+            }
+        }
+    }
+
+    let mut result = Vec::with_capacity(exits.len());
+    for exit in exits {
+        let Some(ref ref_val) = exit.ref_val else {
+            result.push(exit);
+            continue;
+        };
+        if !ref_val.contains(',') {
+            result.push(exit);
+            continue;
+        }
+
+        result.push(exit.clone()); // Keep original compound form
+
+        // Find the numeric base of the first part
+        let first_part = ref_val.split(',').next().unwrap_or("").trim();
+        let base_len = first_part
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        let base = &first_part[..base_len];
+
+        for part in ref_val.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+
+            // If the part starts with a digit, it's a full ref (e.g., "12A" in "12A,12B")
+            // If it's just letters, prepend the base (e.g., "B" in "11A,B" → "11B")
+            let expanded = if part.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                part.to_string()
+            } else if !base.is_empty() {
+                format!("{}{}", base, part)
+            } else {
+                continue;
+            };
+
+            if individual_refs.contains(&expanded) {
+                continue;
             }
             result.push(ExitRow {
                 exit_id: format!("{}:{}", exit.exit_id, expanded),
