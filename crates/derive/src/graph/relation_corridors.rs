@@ -504,6 +504,17 @@ fn build_corridor_draft(
     // gore-point split as fallback for ref values with no dedicated node.
     let corridor_exit_rows = resolve_semicolon_refs(corridor_exit_rows);
 
+    // Only keep exits that have at least a ref (exit number) or a name.
+    // Bare motorway_junction nodes with neither are not useful to downstream
+    // consumers and may be system interchanges or mapping artifacts.
+    let corridor_exit_rows: Vec<ExitRow> = corridor_exit_rows
+        .into_iter()
+        .filter(|exit| {
+            exit.ref_val.as_ref().is_some_and(|r| !r.is_empty())
+                || exit.name.as_ref().is_some_and(|n| !n.is_empty())
+        })
+        .collect();
+
     let exits = order_exits_along_route(corridor_exit_rows, &route_segments);
     let edge_ids = matched_edge_ids(edge_rows, &group.highway, &assigned_way_ids);
 
