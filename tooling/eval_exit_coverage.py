@@ -149,6 +149,21 @@ def load_ground_truth_pairs() -> set[tuple[str, str]]:
     return {(dn, sn.strip()) for dn, sn in rows}
 
 
+def _ref_in_oi(hw: str, ref: str, oi_pairs: set[tuple[str, str]]) -> bool:
+    """Check if a (highway, ref) pair is covered by OI, including aliasing.
+
+    Checks: exact match, base-number aliasing (121A → 121),
+    and directional suffix aliasing (29N → 29).
+    """
+    if (hw, ref) in oi_pairs:
+        return True
+    # Base-number: "121A" covered if OI has "121"
+    m = re.match(r"^(\d+)[A-Z]$", ref)
+    if m and (hw, m.group(1)) in oi_pairs:
+        return True
+    return False
+
+
 def match_with_normalization(
     ground_truth_pairs: set[tuple[str, str]],
     oi_pairs: set[tuple[str, str]],
@@ -156,23 +171,22 @@ def match_with_normalization(
     """Match ground truth pairs against OI pairs, with compound-ref normalization.
 
     A compound ground truth ref like "19A,B" is considered matched if ALL of its
-    expanded parts ("19A", "19B") are in OI. The original compound form
-    counts as one match (not inflating the denominator).
+    expanded parts ("19A", "19B") are in OI (with aliasing applied to each
+    part). The original compound form counts as one match.
     """
     matched = ground_truth_pairs & oi_pairs
 
     # For unmatched compound refs, check if expanded forms are all in OI
     for hw, ref in ground_truth_pairs - matched:
         alts = normalize_ground_truth_ref(ref)
-        if alts and all((hw, alt) in oi_pairs for alt in alts):
+        if alts and all(_ref_in_oi(hw, alt, oi_pairs) for alt in alts):
             matched.add((hw, ref))
 
     # For unmatched lettered exits (e.g. "121A"), check if OI has the
     # base number ("121"). OSM often tags a single exit node with the
     # bare number where ground truth splits the interchange into A/B/C.
     for hw, ref in ground_truth_pairs - matched:
-        m = re.match(r"^(\d+)[A-Z]$", ref)
-        if m and (hw, m.group(1)) in oi_pairs:
+        if _ref_in_oi(hw, ref, oi_pairs):
             matched.add((hw, ref))
 
     return matched
