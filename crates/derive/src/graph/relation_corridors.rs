@@ -528,6 +528,7 @@ fn build_corridor_draft(
     let corridor_exit_rows = resolve_semicolon_refs(corridor_exit_rows);
     let corridor_exit_rows = expand_compound_refs(corridor_exit_rows);
     let corridor_exit_rows = expand_comma_refs(corridor_exit_rows);
+    let corridor_exit_rows = synthesize_merged_letter_refs(corridor_exit_rows);
 
     // Only keep exits that have at least a ref (exit number) or a name.
     // Bare motorway_junction nodes with neither are not useful to downstream
@@ -1579,6 +1580,75 @@ fn expand_comma_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
             });
         }
     }
+    result
+}
+
+/// Synthesize merged letter refs like "214AB" from adjacent individual
+/// letter exits ("214A", "214B") at the same graph node. Many exit
+/// databases store the combined form rather than individual letters.
+fn synthesize_merged_letter_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
+    // Group lettered exits by (base_number, graph_node)
+    let mut groups: HashMap<(String, i64), Vec<(char, usize)>> = HashMap::new();
+    for (idx, exit) in exits.iter().enumerate() {
+        let Some(ref ref_val) = exit.ref_val else {
+            continue;
+        };
+        let bytes = ref_val.as_bytes();
+        // Must end with a single uppercase letter preceded by digits
+        if bytes.len() < 2 {
+            continue;
+        }
+        let last = *bytes.last().unwrap();
+        if !last.is_ascii_uppercase() {
+            continue;
+        }
+        let base = &ref_val[..ref_val.len() - 1];
+        if !base.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        groups
+            .entry((base.to_string(), exit.graph_node))
+            .or_default()
+            .push((last as char, idx));
+    }
+
+    let existing_refs: HashSet<String> = exits
+        .iter()
+        .filter_map(|e| e.ref_val.clone())
+        .collect();
+
+    let mut new_exits = Vec::new();
+    for ((base, _node), mut letters) in groups {
+        if letters.len() < 2 {
+            continue;
+        }
+        letters.sort_by_key(|&(ch, _)| ch);
+        // Build the merged form: "214" + "AB" = "214AB"
+        let merged: String =
+            std::iter::once(base.as_str().to_string())
+                .chain(std::iter::empty::<String>())
+                .next()
+                .unwrap()
+                + &letters.iter().map(|&(ch, _)| ch).collect::<String>();
+        if existing_refs.contains(&merged) {
+            continue;
+        }
+        // Use the first lettered exit as the template
+        let template_idx = letters[0].1;
+        let template = &exits[template_idx];
+        new_exits.push(ExitRow {
+            exit_id: format!("{}:{}", template.exit_id, merged),
+            highway: template.highway.clone(),
+            graph_node: template.graph_node,
+            ref_val: Some(merged),
+            name: template.name.clone(),
+            lat: template.lat,
+            lon: template.lon,
+        });
+    }
+
+    let mut result = exits;
+    result.extend(new_exits);
     result
 }
 
