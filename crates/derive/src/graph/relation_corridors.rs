@@ -1413,7 +1413,7 @@ fn discover_sibling_exits(
     exits: Vec<ExitRow>,
     all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
 ) -> Vec<ExitRow> {
-    const MAX_DISTANCE_M: f64 = 2_000.0;
+    const MAX_DISTANCE_M: f64 = 5_000.0;
 
     // Collect base numbers and their positions from existing corridor exits
     let mut base_positions: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
