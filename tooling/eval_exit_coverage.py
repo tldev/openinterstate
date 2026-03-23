@@ -16,6 +16,7 @@ Exit codes:
 import argparse
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -93,11 +94,18 @@ def load_oi_pairs() -> set[tuple[str, str]]:
             continue
         parts = line.split("\t")
         if len(parts) >= 2:
-            pairs.add((parts[0], parts[1]))
+            hw, ref = parts[0], parts[1]
+            pairs.add((hw, ref))
             # Also add base highway for letter-suffix routes (I-35E → I-35)
-            base = strip_highway_suffix(parts[0])
-            if base:
-                pairs.add((base, parts[1]))
+            base_hw = strip_highway_suffix(hw)
+            if base_hw:
+                pairs.add((base_hw, ref))
+            # If ref is lettered like "153A", also count as covering "153"
+            if re.match(r'^\d+[A-Z]$', ref):
+                base_ref = ref[:-1]
+                pairs.add((hw, base_ref))
+                if base_hw:
+                    pairs.add((base_hw, base_ref))
     return pairs
 
 
