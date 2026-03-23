@@ -89,11 +89,22 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
                 elif base:
                     alts.append(f"{base}{p}")
 
-    # Slash format: "228 / 229" → "228","229"
+    # Slash format: "228 / 229" → "228","229"; "13A/B" → "13A","13B"
     if "/" in ref_val:
         parts = [p.strip() for p in ref_val.split("/") if p.strip()]
-        if len(parts) >= 2 and all(re.match(r"^\d", p) for p in parts):
-            alts.extend(parts)
+        if len(parts) >= 2:
+            if all(re.match(r"^\d", p) for p in parts):
+                alts.extend(parts)
+            else:
+                first = parts[0]
+                m = re.match(r"^(\d+)", first)
+                base = m.group(1) if m else ""
+                if base:
+                    for p in parts:
+                        if re.match(r"^\d", p):
+                            alts.append(p)
+                        else:
+                            alts.append(f"{base}{p}")
 
     # Semicolon: "143A;143B" → "143A","143B"; "64A;B" → "64A","64B"
     if ";" in ref_val:
