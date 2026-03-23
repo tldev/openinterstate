@@ -469,14 +469,23 @@ fn build_corridor_draft(
     let expanded_nodes =
         expand_nodes_with_adjacent_ways(&assigned_nodes, &group.highway, ways_by_id);
 
-    // Collect exits from exit_corridors (graph-assigned) that fall within expanded nodes
+    // Collect exits from two sources, each with different coordinate provenance:
+    //
+    // 1. exit_corridors (graph-assigned): coordinates come from the graph node
+    //    that the exit was snapped to during graph compression. These are on the
+    //    mainline carriageway, not the physical ramp.
+    //
+    // 2. Direct exit node lookup (load_all_exit_nodes): coordinates come from the
+    //    original motorway_junction node in OSM, typically on the ramp way itself.
+    //    These are more accurate for POI reachability since they reflect the
+    //    actual ramp location.
     let mut corridor_exit_rows: Vec<ExitRow> = exit_rows
         .iter()
         .filter(|exit| expanded_nodes.contains(&exit.graph_node))
         .cloned()
         .collect();
 
-    // Also discover exit nodes on expanded ways that weren't in exit_corridors.
+    // Discover exit nodes on expanded ways that weren't in exit_corridors.
     // These are typically on blank-ref motorway_link ramps connected to the corridor.
     let known_nodes: HashSet<i64> = corridor_exit_rows
         .iter()
@@ -1260,8 +1269,10 @@ fn resolve_semicolon_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
                 // gore-point duplicate so the ramp-level coordinates are used.
                 continue;
             }
+            // Use a distinct exit_id per split part so downstream consumers
+            // can differentiate them (the original node may host multiple exits).
             result.push(ExitRow {
-                exit_id: exit.exit_id.clone(),
+                exit_id: format!("{}:{}", exit.exit_id, part),
                 highway: exit.highway.clone(),
                 graph_node: exit.graph_node,
                 ref_val: Some(part.to_string()),
@@ -1673,7 +1684,7 @@ mod tests {
     use super::{
         allowed_refs_for_pair, allowed_refs_for_route, build_connector_graph,
         connector_way_allowed_for_refs, filter_route_groups, prune_micro_route_segments,
-        shortest_connector_path_to_any, validate_edge_claims, HighwayEdgeRow, RouteWay,
+        shortest_connector_path_to_any, validate_edge_claims, ExitRow, HighwayEdgeRow, RouteWay,
         SHORT_FALLBACK_CONNECTOR_MAX_COST_M,
     };
     use crate::interstate_relations::{InterstateRelationMember, InterstateRouteGroup};
@@ -2340,5 +2351,73 @@ mod tests {
         assert!(!expanded.contains(&70), "node on disconnected blank-ref link should be excluded");
         // Blank-ref trunk (not a _link): excluded
         assert!(!expanded.contains(&80), "node on blank-ref trunk (not link) should be excluded");
+    }
+
+    fn exit_row(exit_id: &str, graph_node: i64, ref_val: Option<&str>) -> ExitRow {
+        ExitRow {
+            exit_id: exit_id.to_string(),
+            highway: "I-95".to_string(),
+            graph_node,
+            ref_val: ref_val.map(ToString::to_string),
+            name: None,
+            lat: 40.0,
+            lon: -80.0,
+        }
+    }
+
+    #[test]
+    fn resolve_semicolon_splits_compound_ref() {
+        let exits = vec![exit_row("node/100", 100, Some("23A;23B"))];
+        let resolved = super::resolve_semicolon_refs(exits);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].ref_val.as_deref(), Some("23A"));
+        assert_eq!(resolved[1].ref_val.as_deref(), Some("23B"));
+    }
+
+    #[test]
+    fn resolve_semicolon_split_assigns_distinct_exit_ids() {
+        let exits = vec![exit_row("node/100", 100, Some("23A;23B"))];
+        let resolved = super::resolve_semicolon_refs(exits);
+        assert_ne!(resolved[0].exit_id, resolved[1].exit_id);
+        assert_eq!(resolved[0].exit_id, "node/100:23A");
+        assert_eq!(resolved[1].exit_id, "node/100:23B");
+    }
+
+    #[test]
+    fn resolve_semicolon_skips_part_with_dedicated_node() {
+        let exits = vec![
+            exit_row("node/100", 100, Some("23A;23B")),
+            exit_row("node/200", 200, Some("23A")), // dedicated ramp node for 23A
+        ];
+        let resolved = super::resolve_semicolon_refs(exits);
+        let refs: Vec<_> = resolved.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        // 23A from gore-point should be dropped; only 23B from split + 23A from dedicated node
+        assert_eq!(refs, vec!["23B", "23A"]);
+        // The 23A entry should be from the dedicated node, not the gore-point
+        let exit_23a = resolved.iter().find(|e| e.ref_val.as_deref() == Some("23A")).unwrap();
+        assert_eq!(exit_23a.graph_node, 200);
+    }
+
+    #[test]
+    fn resolve_semicolon_passes_through_non_semicolon_refs() {
+        let exits = vec![
+            exit_row("node/1", 1, Some("42")),
+            exit_row("node/2", 2, None),
+            exit_row("node/3", 3, Some("43")),
+        ];
+        let resolved = super::resolve_semicolon_refs(exits);
+        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved[0].ref_val.as_deref(), Some("42"));
+        assert_eq!(resolved[1].ref_val, None);
+        assert_eq!(resolved[2].ref_val.as_deref(), Some("43"));
+    }
+
+    #[test]
+    fn resolve_semicolon_handles_whitespace_and_empty_parts() {
+        let exits = vec![exit_row("node/100", 100, Some(" 5A ; 5B ; "))];
+        let resolved = super::resolve_semicolon_refs(exits);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].ref_val.as_deref(), Some("5A"));
+        assert_eq!(resolved[1].ref_val.as_deref(), Some("5B"));
     }
 }
