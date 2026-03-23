@@ -1381,10 +1381,11 @@ fn expand_nodes_with_adjacent_ways(
 ) -> HashSet<i64> {
     let mut expanded = assigned_nodes.clone();
 
-    // Two-hop expansion: first expand through same-ref and blank-link ways,
-    // then expand once more through blank-link ways only (catches ramps
-    // connected via intermediate junction nodes).
-    for hop in 0..2 {
+    // Three-hop expansion: first expand through same-ref and blank-link ways,
+    // then expand twice more through blank-link ways only (catches ramps
+    // connected via intermediate junction nodes, including exits at the
+    // far end of longer ramp sequences).
+    for hop in 0..3 {
         let frontier = expanded.clone();
         for way in ways_by_id.values() {
             let has_same_ref = way.refs.iter().any(|r| r == route_highway);
@@ -1393,7 +1394,7 @@ fn expand_nodes_with_adjacent_ways(
             if hop == 0 && !has_same_ref && !is_blank_link {
                 continue;
             }
-            if hop == 1 && !is_blank_link {
+            if hop >= 1 && !is_blank_link {
                 continue;
             }
             if way.nodes.iter().any(|node| frontier.contains(node)) {
