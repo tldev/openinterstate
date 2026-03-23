@@ -167,6 +167,14 @@ def match_with_normalization(
         if alts and all((hw, alt) in oi_pairs for alt in alts):
             matched.add((hw, ref))
 
+    # For unmatched lettered exits (e.g. "121A"), check if OI has the
+    # base number ("121"). OSM often tags a single exit node with the
+    # bare number where ground truth splits the interchange into A/B/C.
+    for hw, ref in ground_truth_pairs - matched:
+        m = re.match(r"^(\d+)[A-Z]$", ref)
+        if m and (hw, m.group(1)) in oi_pairs:
+            matched.add((hw, ref))
+
     return matched
 
 
