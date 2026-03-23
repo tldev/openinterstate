@@ -524,8 +524,17 @@ fn build_corridor_draft(
 
     // Discover sibling exits: if we have "100B", look for nearby "100A", "100C"
     // in the full exit node set. Siblings share the same base number and are
-    // within 2km of an existing corridor exit.
+    // within 5km of an existing corridor exit.
     let corridor_exit_rows = discover_sibling_exits(corridor_exit_rows, all_exit_nodes);
+
+    // Discover exits near the corridor geometry but not reachable through
+    // graph expansion (e.g. exits on distant ramps or service roads).
+    let corridor_exit_rows = discover_nearby_exits(
+        corridor_exit_rows,
+        all_exit_nodes,
+        &route_segments,
+        &group.highway,
+    );
 
     // Resolve semicolon-separated refs (e.g. "143A;143B" at a gore-point node).
     // Prefer individual ramp-level nodes when they exist; only keep the
@@ -1498,6 +1507,126 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let a = (dlat / 2.0).sin().powi(2)
         + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
     2.0 * r * a.sqrt().asin()
+}
+
+/// Minimum distance from a point to a polyline segment (point-to-segment).
+fn point_to_segment_distance_m(
+    plat: f64,
+    plon: f64,
+    alat: f64,
+    alon: f64,
+    blat: f64,
+    blon: f64,
+) -> f64 {
+    // Project point onto segment in lat/lon space, then compute haversine
+    let dx = blon - alon;
+    let dy = blat - alat;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-16 {
+        return haversine_m(plat, plon, alat, alon);
+    }
+    let t = ((plon - alon) * dx + (plat - alat) * dy) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    let closest_lat = alat + t * dy;
+    let closest_lon = alon + t * dx;
+    haversine_m(plat, plon, closest_lat, closest_lon)
+}
+
+/// Minimum distance from a point to a route geometry (multi-segment polyline).
+fn point_to_route_distance_m(lat: f64, lon: f64, route_segments: &[Vec<[f64; 2]>]) -> f64 {
+    let mut min_dist = f64::MAX;
+    for segment in route_segments {
+        for window in segment.windows(2) {
+            let d = point_to_segment_distance_m(
+                lat,
+                lon,
+                window[0][0],
+                window[0][1],
+                window[1][0],
+                window[1][1],
+            );
+            if d < min_dist {
+                min_dist = d;
+            }
+        }
+    }
+    min_dist
+}
+
+/// Discover exit nodes near the corridor geometry that weren't found via
+/// graph expansion. Uses a bounding-box pre-filter then checks point-to-polyline
+/// distance. Catches exits on distant ramps or service roads.
+fn discover_nearby_exits(
+    exits: Vec<ExitRow>,
+    all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
+    route_segments: &[Vec<[f64; 2]>],
+    highway: &str,
+) -> Vec<ExitRow> {
+    const MAX_DISTANCE_M: f64 = 500.0;
+    // Approximate degree buffer for the bounding box pre-filter (~1km)
+    const BBOX_BUFFER_DEG: f64 = 0.01;
+
+    // Build bounding box from route geometry
+    let mut min_lat = f64::MAX;
+    let mut max_lat = f64::MIN;
+    let mut min_lon = f64::MAX;
+    let mut max_lon = f64::MIN;
+    for segment in route_segments {
+        for point in segment {
+            min_lat = min_lat.min(point[0]);
+            max_lat = max_lat.max(point[0]);
+            min_lon = min_lon.min(point[1]);
+            max_lon = max_lon.max(point[1]);
+        }
+    }
+    min_lat -= BBOX_BUFFER_DEG;
+    max_lat += BBOX_BUFFER_DEG;
+    min_lon -= BBOX_BUFFER_DEG;
+    max_lon += BBOX_BUFFER_DEG;
+
+    let known_nodes: HashSet<i64> = exits.iter().map(|e| e.graph_node).collect();
+    let mut known_refs: HashSet<String> = HashSet::new();
+    for exit in &exits {
+        if let Some(ref r) = exit.ref_val {
+            known_refs.insert(r.clone());
+        }
+    }
+
+    let mut new_exits = Vec::new();
+    for (&node_id, info) in all_exit_nodes {
+        if known_nodes.contains(&node_id) {
+            continue;
+        }
+        // Skip exits without a ref — we can't match them anyway
+        let Some(ref ref_val) = info.ref_val else {
+            continue;
+        };
+        if ref_val.is_empty() || known_refs.contains(ref_val) {
+            continue;
+        }
+        // Bounding box pre-filter
+        if info.lat < min_lat || info.lat > max_lat || info.lon < min_lon || info.lon > max_lon {
+            continue;
+        }
+        // Precise distance check
+        let dist = point_to_route_distance_m(info.lat, info.lon, route_segments);
+        if dist <= MAX_DISTANCE_M {
+            new_exits.push(ExitRow {
+                exit_id: format!("node/{}", node_id),
+                highway: highway.to_string(),
+                graph_node: node_id,
+                ref_val: info.ref_val.clone(),
+                name: info.name.clone(),
+                lat: info.lat,
+                lon: info.lon,
+            });
+            known_refs.insert(ref_val.clone());
+        }
+    }
+
+    let mut result = exits;
+    result.extend(new_exits);
+    result
 }
 
 /// Split semicolon-separated exit refs (e.g. "143A;143B") into individual
