@@ -151,6 +151,11 @@ pub async fn build_corridors(
     let connector_graph = build_connector_graph(ways_by_id.values().collect::<Vec<_>>().as_slice());
     let highway_edges = load_highway_edges(pool).await?;
     let exits = load_exit_rows(pool).await?;
+    let all_exit_nodes = load_all_exit_nodes(pool).await?;
+    tracing::info!(
+        "Loaded {} exit nodes from osm2pgsql_v2_exits_nodes",
+        all_exit_nodes.len()
+    );
 
     let mut exits_by_highway: HashMap<String, Vec<ExitRow>> = HashMap::new();
     for exit in exits {
@@ -183,6 +188,7 @@ pub async fn build_corridors(
                 .get(&group.highway)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
+            &all_exit_nodes,
             next_corridor_id,
         )?
         else {
@@ -363,12 +369,48 @@ async fn load_exit_rows(pool: &PgPool) -> Result<Vec<ExitRow>, anyhow::Error> {
         .collect())
 }
 
+/// Load all motorway_junction exit nodes keyed by OSM node id.
+/// This supplements `exit_corridors` by providing exit metadata for nodes
+/// that appear on ramp ways not adopted during graph compression.
+async fn load_all_exit_nodes(pool: &PgPool) -> Result<HashMap<i64, ExitNodeInfo>, anyhow::Error> {
+    let rows: Vec<(i64, Option<String>, Option<String>, f64, f64)> = sqlx::query_as(
+        "SELECT node_id, ref, name, ST_Y(geom) AS lat, ST_X(geom) AS lon \
+         FROM osm2pgsql_v2_exits_nodes",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(node_id, ref_val, name, lat, lon)| {
+            (
+                node_id,
+                ExitNodeInfo {
+                    ref_val,
+                    name,
+                    lat,
+                    lon,
+                },
+            )
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+struct ExitNodeInfo {
+    ref_val: Option<String>,
+    name: Option<String>,
+    lat: f64,
+    lon: f64,
+}
+
 fn build_corridor_draft(
     group: &InterstateRouteGroup,
     ways_by_id: &HashMap<i64, RouteWay>,
     connector_graph: &ConnectorGraph,
     edge_rows: &[HighwayEdgeRow],
     exit_rows: &[ExitRow],
+    all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
     corridor_id: i32,
 ) -> Result<Option<CorridorDraft>, anyhow::Error> {
     let canonical_direction = group
@@ -424,14 +466,45 @@ fn build_corridor_draft(
         .iter()
         .flat_map(|way| way.nodes.iter().copied())
         .collect();
-    let exits = order_exits_along_route(
-        exit_rows
-            .iter()
-            .filter(|exit| assigned_nodes.contains(&exit.graph_node))
-            .cloned()
-            .collect(),
-        &route_segments,
-    );
+    let expanded_nodes =
+        expand_nodes_with_adjacent_ways(&assigned_nodes, &group.highway, ways_by_id);
+
+    // Collect exits from exit_corridors (graph-assigned) that fall within expanded nodes
+    let mut corridor_exit_rows: Vec<ExitRow> = exit_rows
+        .iter()
+        .filter(|exit| expanded_nodes.contains(&exit.graph_node))
+        .cloned()
+        .collect();
+
+    // Also discover exit nodes on expanded ways that weren't in exit_corridors.
+    // These are typically on blank-ref motorway_link ramps connected to the corridor.
+    let known_nodes: HashSet<i64> = corridor_exit_rows
+        .iter()
+        .map(|exit| exit.graph_node)
+        .collect();
+    for &node_id in &expanded_nodes {
+        if known_nodes.contains(&node_id) {
+            continue;
+        }
+        if let Some(info) = all_exit_nodes.get(&node_id) {
+            corridor_exit_rows.push(ExitRow {
+                exit_id: format!("node/{}", node_id),
+                highway: group.highway.clone(),
+                graph_node: node_id,
+                ref_val: info.ref_val.clone(),
+                name: info.name.clone(),
+                lat: info.lat,
+                lon: info.lon,
+            });
+        }
+    }
+
+    // Resolve semicolon-separated refs (e.g. "143A;143B" at a gore-point node).
+    // Prefer individual ramp-level nodes when they exist; only keep the
+    // gore-point split as fallback for ref values with no dedicated node.
+    let corridor_exit_rows = resolve_semicolon_refs(corridor_exit_rows);
+
+    let exits = order_exits_along_route(corridor_exit_rows, &route_segments);
     let edge_ids = matched_edge_ids(edge_rows, &group.highway, &assigned_way_ids);
 
     let source_way_ids: Vec<i64> = assigned_way_ids.into_iter().collect();
@@ -1136,6 +1209,60 @@ fn compute_components(adjacency: &HashMap<i64, HashSet<i64>>) -> HashMap<i64, i3
     component_by_node
 }
 
+/// Resolve semicolon-separated exit refs (e.g. "143A;143B" at a gore-point
+/// node) by preferring individual ramp-level nodes when they exist.
+///
+/// For each semicolon ref like "143A;143B" on node X:
+///   - If a separate node Y already carries ref "143A", keep Y and drop
+///     the "143A" part from X.  This ensures each exit number maps to its
+///     own physical ramp node with distinct lat/lon.
+///   - If no dedicated node carries "143A", create a split entry at node X
+///     as a fallback (same coordinates, but at least the ref is recorded).
+///   - If ALL parts are covered by individual nodes, drop node X entirely.
+fn resolve_semicolon_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
+    // Build index of which individual (non-semicolon) refs already exist
+    let mut individual_refs: HashSet<String> = HashSet::new();
+    for exit in &exits {
+        if let Some(ref r) = exit.ref_val {
+            if !r.contains(';') {
+                individual_refs.insert(r.clone());
+            }
+        }
+    }
+
+    let mut result = Vec::with_capacity(exits.len());
+    for exit in exits {
+        let Some(ref ref_val) = exit.ref_val else {
+            result.push(exit);
+            continue;
+        };
+        if !ref_val.contains(';') {
+            result.push(exit);
+            continue;
+        }
+
+        // Semicolon-separated: split and only keep parts without a dedicated node
+        let parts: Vec<&str> = ref_val.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        for part in parts {
+            if individual_refs.contains(part) {
+                // A dedicated ramp node already carries this ref — skip the
+                // gore-point duplicate so the ramp-level coordinates are used.
+                continue;
+            }
+            result.push(ExitRow {
+                exit_id: exit.exit_id.clone(),
+                highway: exit.highway.clone(),
+                graph_node: exit.graph_node,
+                ref_val: Some(part.to_string()),
+                name: exit.name.clone(),
+                lat: exit.lat,
+                lon: exit.lon,
+            });
+        }
+    }
+    result
+}
+
 fn order_exits_along_route(
     exits: Vec<ExitRow>,
     segments: &[Vec<[f64; 2]>],
@@ -1189,6 +1316,37 @@ fn closest_distance_along_route(route_points: &[([f64; 2], f64)], target: [f64; 
         .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal))
         .map(|(_, distance_m)| distance_m)
         .unwrap_or(0.0)
+}
+
+/// Expand the set of corridor nodes by including nodes from ways that
+/// share at least one node with an already-assigned way AND either:
+/// (a) carry `route_highway` in their ref list, OR
+/// (b) are `_link` ways (motorway_link, trunk_link, etc.) with no ref tags.
+///
+/// Case (a) captures exits on adjacent branch ways that carry the same
+/// highway ref but were not part of the OSM route relation.
+///
+/// Case (b) captures exit nodes sitting on ramp ways that connect to the
+/// corridor mainline. These ramps are typically tagged only as
+/// `highway=motorway_link` without any ref — the exit nodes
+/// (`motorway_junction`) on them carry the actual exit number.
+fn expand_nodes_with_adjacent_ways(
+    assigned_nodes: &HashSet<i64>,
+    route_highway: &str,
+    ways_by_id: &HashMap<i64, RouteWay>,
+) -> HashSet<i64> {
+    let mut expanded = assigned_nodes.clone();
+    for way in ways_by_id.values() {
+        let has_same_ref = way.refs.iter().any(|r| r == route_highway);
+        let is_blank_link = way.highway_type.ends_with("_link") && way.refs.is_empty();
+        if !has_same_ref && !is_blank_link {
+            continue;
+        }
+        if way.nodes.iter().any(|node| assigned_nodes.contains(node)) {
+            expanded.extend(way.nodes.iter().copied());
+        }
+    }
+    expanded
 }
 
 fn matched_edge_ids(
@@ -2091,5 +2249,85 @@ mod tests {
         ]);
 
         assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn expand_nodes_includes_adjacent_same_ref_way() {
+        let mut ways = HashMap::new();
+        // Assigned way: nodes [1, 2, 3]
+        ways.insert(
+            100,
+            route_way(100, &["I-95"], &[1, 2, 3], &[(40.0, -80.0), (40.1, -80.0), (40.2, -80.0)], "motorway", true),
+        );
+        // Adjacent way shares node 3, has same ref: nodes [3, 4, 5]
+        ways.insert(
+            200,
+            route_way(200, &["I-95"], &[3, 4, 5], &[(40.2, -80.0), (40.2, -80.01), (40.2, -80.02)], "motorway_link", true),
+        );
+        // Unconnected way with same ref: nodes [10, 11]
+        ways.insert(
+            300,
+            route_way(300, &["I-95"], &[10, 11], &[(41.0, -80.0), (41.1, -80.0)], "motorway", true),
+        );
+        // Adjacent way shares node 2 but DIFFERENT ref: nodes [2, 20, 21]
+        ways.insert(
+            400,
+            route_way(400, &["I-76"], &[2, 20, 21], &[(40.1, -80.0), (40.1, -80.1), (40.1, -80.2)], "motorway", true),
+        );
+
+        let assigned: HashSet<i64> = [1, 2, 3].into_iter().collect();
+        let expanded = super::expand_nodes_with_adjacent_ways(&assigned, "I-95", &ways);
+
+        // Should include original + adjacent same-ref way
+        assert!(expanded.contains(&4), "node 4 from adjacent I-95 way should be included");
+        assert!(expanded.contains(&5), "node 5 from adjacent I-95 way should be included");
+        // Should NOT include unconnected same-ref way
+        assert!(!expanded.contains(&10), "node 10 from unconnected way should be excluded");
+        // Should NOT include adjacent different-ref way
+        assert!(!expanded.contains(&20), "node 20 from I-76 way should be excluded");
+    }
+
+    #[test]
+    fn expand_nodes_includes_blank_ref_link_ways() {
+        let mut ways = HashMap::new();
+        // Mainline motorway: nodes [1, 2, 3]
+        ways.insert(
+            100,
+            route_way(100, &["I-10"], &[1, 2, 3], &[(33.0, -112.0), (33.1, -112.0), (33.2, -112.0)], "motorway", true),
+        );
+        // Blank-ref motorway_link ramp sharing node 2: nodes [2, 50, 51]
+        // This represents a ramp with exit node 50 tagged "153A"
+        ways.insert(
+            200,
+            route_way(200, &[], &[2, 50, 51], &[(33.1, -112.0), (33.1, -112.01), (33.1, -112.02)], "motorway_link", true),
+        );
+        // motorway_link with a DIFFERENT ref (e.g. "US 17"), sharing node 3: nodes [3, 60, 61]
+        ways.insert(
+            300,
+            route_way(300, &["US 17"], &[3, 60, 61], &[(33.2, -112.0), (33.2, -112.01), (33.2, -112.02)], "motorway_link", true),
+        );
+        // Blank-ref motorway_link NOT connected to assigned nodes: nodes [70, 71]
+        ways.insert(
+            400,
+            route_way(400, &[], &[70, 71], &[(34.0, -112.0), (34.1, -112.0)], "motorway_link", true),
+        );
+        // Blank-ref trunk (not a _link), sharing node 1: nodes [1, 80, 81]
+        ways.insert(
+            500,
+            route_way(500, &[], &[1, 80, 81], &[(33.0, -112.0), (33.0, -112.1), (33.0, -112.2)], "trunk", true),
+        );
+
+        let assigned: HashSet<i64> = [1, 2, 3].into_iter().collect();
+        let expanded = super::expand_nodes_with_adjacent_ways(&assigned, "I-10", &ways);
+
+        // Blank-ref motorway_link connected to corridor: included
+        assert!(expanded.contains(&50), "exit node on blank-ref ramp should be included");
+        assert!(expanded.contains(&51), "ramp end node on blank-ref ramp should be included");
+        // Different-ref motorway_link: excluded
+        assert!(!expanded.contains(&60), "node on US-17 ramp should be excluded");
+        // Unconnected blank-ref link: excluded
+        assert!(!expanded.contains(&70), "node on disconnected blank-ref link should be excluded");
+        // Blank-ref trunk (not a _link): excluded
+        assert!(!expanded.contains(&80), "node on blank-ref trunk (not link) should be excluded");
     }
 }
