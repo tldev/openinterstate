@@ -1562,9 +1562,9 @@ fn discover_nearby_exits(
     route_segments: &[Vec<[f64; 2]>],
     highway: &str,
 ) -> Vec<ExitRow> {
-    const MAX_DISTANCE_M: f64 = 3_000.0;
-    // Approximate degree buffer for the bounding box pre-filter (~6km)
-    const BBOX_BUFFER_DEG: f64 = 0.06;
+    const MAX_DISTANCE_M: f64 = 5_000.0;
+    // Approximate degree buffer for the bounding box pre-filter (~10km)
+    const BBOX_BUFFER_DEG: f64 = 0.10;
 
     // Build bounding box from route geometry
     let mut min_lat = f64::MAX;
