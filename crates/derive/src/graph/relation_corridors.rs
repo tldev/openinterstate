@@ -536,6 +536,26 @@ fn build_corridor_draft(
         &group.highway,
     );
 
+    // Second proximity pass: also check exits near ALL ways with the same
+    // highway ref, not just the corridor's assigned ways. This catches exits
+    // in sections where the corridor geometry has gaps but the highway ways
+    // still exist in the graph.
+    let all_same_ref_segments: Vec<Vec<[f64; 2]>> = ways_by_id
+        .values()
+        .filter(|way| way.refs.iter().any(|r| r == &group.highway))
+        .map(|way| way.geometry.iter().map(|&(lat, lon)| [lat, lon]).collect())
+        .collect();
+    let corridor_exit_rows = if !all_same_ref_segments.is_empty() {
+        discover_nearby_exits(
+            corridor_exit_rows,
+            all_exit_nodes,
+            &all_same_ref_segments,
+            &group.highway,
+        )
+    } else {
+        corridor_exit_rows
+    };
+
     // Resolve semicolon-separated refs (e.g. "143A;143B" at a gore-point node).
     // Prefer individual ramp-level nodes when they exist; only keep the
     // gore-point split as fallback for ref values with no dedicated node.
