@@ -49,6 +49,49 @@ def query_psql(sql: str) -> str:
     return result.stdout.strip()
 
 
+def normalize_ground_truth_ref(ref_val: str) -> list[str]:
+    """Expand ground truth compound refs into individual forms for matching.
+
+    Returns list of alternative refs (NOT including the original).
+    Only used so that if ground truth has "19A,B" and OI has "19A" + "19B",
+    we count both halves as covered rather than missing "19A,B".
+    """
+    alts = []
+
+    # Comma format: "11A,B" → "11A","11B"; "12A,12B" → "12A","12B"
+    if "," in ref_val:
+        parts = [p.strip() for p in ref_val.split(",") if p.strip()]
+        if len(parts) >= 2:
+            first = parts[0]
+            m = re.match(r"^(\d+)", first)
+            base = m.group(1) if m else ""
+            for p in parts:
+                if re.match(r"^\d", p):
+                    alts.append(p)
+                elif base:
+                    alts.append(f"{base}{p}")
+
+    # Slash format: "228 / 229" → "228","229"
+    if "/" in ref_val:
+        parts = [p.strip() for p in ref_val.split("/") if p.strip()]
+        if len(parts) >= 2 and all(re.match(r"^\d", p) for p in parts):
+            alts.extend(parts)
+
+    # Semicolon: "143A;143B" → "143A","143B"
+    if ";" in ref_val:
+        parts = [p.strip() for p in ref_val.split(";") if p.strip()]
+        if len(parts) >= 2:
+            alts.extend(parts)
+
+    # Dash-range: "14-14A-14B-14C" or "1A-1B"
+    if "-" in ref_val and "," not in ref_val:
+        parts = [p.strip() for p in ref_val.split("-") if p.strip()]
+        if len(parts) >= 2 and all(re.match(r"^\d", p) for p in parts):
+            alts.extend(parts)
+
+    return alts
+
+
 def load_ground_truth_pairs() -> set[tuple[str, str]]:
     conn = sqlite3.connect(GROUND_TRUTH_DB)
     rows = conn.execute(
@@ -66,6 +109,27 @@ def load_ground_truth_pairs() -> set[tuple[str, str]]:
     ).fetchall()
     conn.close()
     return {(dn, sn.strip()) for dn, sn in rows}
+
+
+def match_with_normalization(
+    ground_truth_pairs: set[tuple[str, str]],
+    oi_pairs: set[tuple[str, str]],
+) -> set[tuple[str, str]]:
+    """Match ground truth pairs against OI pairs, with compound-ref normalization.
+
+    A compound ground truth ref like "19A,B" is considered matched if ALL of its
+    expanded parts ("19A", "19B") are in OI. The original compound form
+    counts as one match (not inflating the denominator).
+    """
+    matched = ground_truth_pairs & oi_pairs
+
+    # For unmatched compound refs, check if expanded forms are all in OI
+    for hw, ref in ground_truth_pairs - matched:
+        alts = normalize_ground_truth_ref(ref)
+        if alts and all((hw, alt) in oi_pairs for alt in alts):
+            matched.add((hw, ref))
+
+    return matched
 
 
 def strip_highway_suffix(highway: str) -> str | None:
@@ -162,7 +226,7 @@ def main():
     ground_truth_pairs = load_ground_truth_pairs()
     oi_pairs = load_oi_pairs()
     corridor_count = load_corridor_count()
-    matched = ground_truth_pairs & oi_pairs
+    matched = match_with_normalization(ground_truth_pairs, oi_pairs)
 
     score = 100.0 * len(matched) / len(ground_truth_pairs) if ground_truth_pairs else 0.0
 
