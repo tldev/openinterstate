@@ -60,9 +60,12 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
     ref_val = ref_val.replace("&amp;", "&")
     alts = []
 
+    # Strip internal whitespace for formats like "167 A&B" → "167A&B"
+    ref_val_compact = re.sub(r"(\d+)\s+([A-Z])", r"\1\2", ref_val)
+
     # Ampersand format: "99A&B" → "99A","99B"; "10B&A" → "10A","10B"
-    if "&" in ref_val and "," not in ref_val:
-        parts = [p.strip() for p in ref_val.split("&") if p.strip()]
+    if "&" in ref_val_compact and "," not in ref_val_compact:
+        parts = [p.strip() for p in ref_val_compact.split("&") if p.strip()]
         if len(parts) >= 2:
             first = parts[0]
             m = re.match(r"^(\d+)", first)
@@ -92,11 +95,18 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
         if len(parts) >= 2 and all(re.match(r"^\d", p) for p in parts):
             alts.extend(parts)
 
-    # Semicolon: "143A;143B" → "143A","143B"
+    # Semicolon: "143A;143B" → "143A","143B"; "64A;B" → "64A","64B"
     if ";" in ref_val:
         parts = [p.strip() for p in ref_val.split(";") if p.strip()]
         if len(parts) >= 2:
-            alts.extend(parts)
+            first = parts[0]
+            m = re.match(r"^(\d+)", first)
+            base = m.group(1) if m else ""
+            for p in parts:
+                if re.match(r"^\d", p):
+                    alts.append(p)
+                elif base:
+                    alts.append(f"{base}{p}")
 
     # Dash-range with full refs: "1A-1B" → "1A","1B"; "14-14A-14B" → "14","14A","14B"
     if "-" in ref_val and "," not in ref_val:
@@ -105,7 +115,8 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
             alts.extend(parts)
 
     # Letter-range: "108A-B" → "108A","108B"; "267B-A" → "267A","267B"
-    m = re.match(r"^(\d+)([A-Z])-([A-Z])$", ref_val)
+    # Also handles "67 B-A" via compacted form
+    m = re.match(r"^(\d+)([A-Z])-([A-Z])$", ref_val_compact)
     if m:
         base, start, end = m.group(1), m.group(2), m.group(3)
         lo, hi = min(start, end), max(start, end)
@@ -114,7 +125,7 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
                 alts.append(f"{base}{chr(c)}")
 
     # Concatenated letters: "214AB" → "214A","214B"; "30BC" → "30B","30C"
-    m = re.match(r"^(\d+)([A-Z]{2,})$", ref_val)
+    m = re.match(r"^(\d+)([A-Z]{2,})$", ref_val_compact)
     if m:
         base, letters = m.group(1), m.group(2)
         if len(letters) <= 4:
@@ -123,7 +134,7 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
 
     # Directional suffix: "29N" → "29", "16S" → "16", "84E" → "84"
     # Only strip N/S/E/W (compass directions), not generic letters like A/B/C.
-    m = re.match(r"^(\d+)([NSEW])$", ref_val)
+    m = re.match(r"^(\d+)([NSEW])$", ref_val_compact)
     if m:
         alts.append(m.group(1))
 
