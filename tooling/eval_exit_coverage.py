@@ -67,6 +67,18 @@ def load_ground_truth_pairs() -> set[tuple[str, str]]:
     return {(dn, sn.strip()) for dn, sn in rows}
 
 
+def strip_highway_suffix(highway: str) -> str | None:
+    """Strip directional suffix from highways like I-35E → I-35.
+
+    Only strips single trailing letters (E/W/N/S/C) after the route
+    number, which represent concurrent route splits in the US Interstate
+    system (e.g. I-35E, I-35W, I-69C).
+    """
+    import re
+    m = re.match(r'^(I-\d+)[A-Z]$', highway)
+    return m.group(1) if m else None
+
+
 def load_oi_pairs() -> set[tuple[str, str]]:
     raw = query_psql(
         "SELECT c.highway, ce.ref "
@@ -82,6 +94,10 @@ def load_oi_pairs() -> set[tuple[str, str]]:
         parts = line.split("\t")
         if len(parts) >= 2:
             pairs.add((parts[0], parts[1]))
+            # Also add base highway for letter-suffix routes (I-35E → I-35)
+            base = strip_highway_suffix(parts[0])
+            if base:
+                pairs.add((base, parts[1]))
     return pairs
 
 
