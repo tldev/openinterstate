@@ -83,11 +83,35 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
         if len(parts) >= 2:
             alts.extend(parts)
 
-    # Dash-range: "14-14A-14B-14C" or "1A-1B"
+    # Dash-range with full refs: "1A-1B" → "1A","1B"; "14-14A-14B" → "14","14A","14B"
     if "-" in ref_val and "," not in ref_val:
         parts = [p.strip() for p in ref_val.split("-") if p.strip()]
         if len(parts) >= 2 and all(re.match(r"^\d", p) for p in parts):
             alts.extend(parts)
+
+    # Letter-range: "108A-B" → "108A","108B"; "267B-A" → "267A","267B"
+    m = re.match(r"^(\d+)([A-Z])-([A-Z])$", ref_val)
+    if m:
+        base, start, end = m.group(1), m.group(2), m.group(3)
+        lo, hi = min(start, end), max(start, end)
+        if ord(hi) - ord(lo) <= 5:
+            for c in range(ord(lo), ord(hi) + 1):
+                alts.append(f"{base}{chr(c)}")
+
+    # Concatenated letters: "214AB" → "214A","214B"; "30BC" → "30B","30C"
+    m = re.match(r"^(\d+)([A-Z]{2,})$", ref_val)
+    if m:
+        base, letters = m.group(1), m.group(2)
+        if len(letters) <= 4:
+            for ch in letters:
+                alts.append(f"{base}{ch}")
+
+    # Full-ref dash: "1A-1B" (already handled above if both parts start with digit)
+    # Handle "0A-B" style (letter range with leading zero)
+    m = re.match(r"^(\d+)([A-Z])-([A-Z])$", ref_val)
+    if m and not alts:
+        # Already handled above
+        pass
 
     return alts
 
