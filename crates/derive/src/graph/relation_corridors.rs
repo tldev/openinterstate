@@ -1375,14 +1375,25 @@ fn expand_nodes_with_adjacent_ways(
     ways_by_id: &HashMap<i64, RouteWay>,
 ) -> HashSet<i64> {
     let mut expanded = assigned_nodes.clone();
-    for way in ways_by_id.values() {
-        let has_same_ref = way.refs.iter().any(|r| r == route_highway);
-        let is_blank_link = way.highway_type.ends_with("_link") && way.refs.is_empty();
-        if !has_same_ref && !is_blank_link {
-            continue;
-        }
-        if way.nodes.iter().any(|node| assigned_nodes.contains(node)) {
-            expanded.extend(way.nodes.iter().copied());
+
+    // Two-hop expansion: first expand through same-ref and blank-link ways,
+    // then expand once more through blank-link ways only (catches ramps
+    // connected via intermediate junction nodes).
+    for hop in 0..2 {
+        let frontier = expanded.clone();
+        for way in ways_by_id.values() {
+            let has_same_ref = way.refs.iter().any(|r| r == route_highway);
+            let is_blank_link = way.highway_type.ends_with("_link") && way.refs.is_empty();
+            // First hop: same-ref or blank links; second hop: blank links only
+            if hop == 0 && !has_same_ref && !is_blank_link {
+                continue;
+            }
+            if hop == 1 && !is_blank_link {
+                continue;
+            }
+            if way.nodes.iter().any(|node| frontier.contains(node)) {
+                expanded.extend(way.nodes.iter().copied());
+            }
         }
     }
     expanded
@@ -1587,14 +1598,18 @@ fn expand_comma_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
 /// letter exits ("214A", "214B") at the same graph node. Many exit
 /// databases store the combined form rather than individual letters.
 fn synthesize_merged_letter_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
-    // Group lettered exits by (base_number, graph_node)
-    let mut groups: HashMap<(String, i64), Vec<(char, usize)>> = HashMap::new();
+    // Collect lettered exits by their base number and letter.
+    struct LetterEntry {
+        ch: char,
+        idx: usize,
+        node: i64,
+    }
+    let mut by_base: HashMap<String, Vec<LetterEntry>> = HashMap::new();
     for (idx, exit) in exits.iter().enumerate() {
         let Some(ref ref_val) = exit.ref_val else {
             continue;
         };
         let bytes = ref_val.as_bytes();
-        // Must end with a single uppercase letter preceded by digits
         if bytes.len() < 2 {
             continue;
         }
@@ -1606,10 +1621,14 @@ fn synthesize_merged_letter_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
         if !base.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        groups
-            .entry((base.to_string(), exit.graph_node))
+        by_base
+            .entry(base.to_string())
             .or_default()
-            .push((last as char, idx));
+            .push(LetterEntry {
+                ch: last as char,
+                idx,
+                node: exit.graph_node,
+            });
     }
 
     let existing_refs: HashSet<String> = exits
@@ -1618,33 +1637,64 @@ fn synthesize_merged_letter_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
         .collect();
 
     let mut new_exits = Vec::new();
-    for ((base, _node), mut letters) in groups {
-        if letters.len() < 2 {
-            continue;
+    for (base, entries) in &by_base {
+        // Strategy 1: group by node (preserves per-node merged forms like "1CD")
+        let mut by_node: HashMap<i64, Vec<&LetterEntry>> = HashMap::new();
+        for entry in entries {
+            by_node.entry(entry.node).or_default().push(entry);
         }
-        letters.sort_by_key(|&(ch, _)| ch);
-        // Build the merged form: "214" + "AB" = "214AB"
-        let merged: String =
-            std::iter::once(base.as_str().to_string())
-                .chain(std::iter::empty::<String>())
-                .next()
-                .unwrap()
-                + &letters.iter().map(|&(ch, _)| ch).collect::<String>();
-        if existing_refs.contains(&merged) {
-            continue;
+        for (_node, mut node_entries) in by_node {
+            if node_entries.len() < 2 {
+                continue;
+            }
+            node_entries.sort_by_key(|e| e.ch);
+            let merged = format!(
+                "{}{}",
+                base,
+                node_entries.iter().map(|e| e.ch).collect::<String>()
+            );
+            if existing_refs.contains(&merged) {
+                continue;
+            }
+            let template = &exits[node_entries[0].idx];
+            new_exits.push(ExitRow {
+                exit_id: format!("{}:{}", template.exit_id, merged),
+                highway: template.highway.clone(),
+                graph_node: template.graph_node,
+                ref_val: Some(merged),
+                name: template.name.clone(),
+                lat: template.lat,
+                lon: template.lon,
+            });
         }
-        // Use the first lettered exit as the template
-        let template_idx = letters[0].1;
-        let template = &exits[template_idx];
-        new_exits.push(ExitRow {
-            exit_id: format!("{}:{}", template.exit_id, merged),
-            highway: template.highway.clone(),
-            graph_node: template.graph_node,
-            ref_val: Some(merged),
-            name: template.name.clone(),
-            lat: template.lat,
-            lon: template.lon,
-        });
+
+        // Strategy 2: also generate the full merged form across all nodes
+        if entries.len() >= 2 {
+            let mut sorted: Vec<_> = entries.iter().collect();
+            sorted.sort_by_key(|e| e.ch);
+            sorted.dedup_by_key(|e| e.ch);
+            if sorted.len() >= 2 {
+                let merged = format!(
+                    "{}{}",
+                    base,
+                    sorted.iter().map(|e| e.ch).collect::<String>()
+                );
+                if !existing_refs.contains(&merged)
+                    && !new_exits.iter().any(|e| e.ref_val.as_deref() == Some(&merged))
+                {
+                    let template = &exits[sorted[0].idx];
+                    new_exits.push(ExitRow {
+                        exit_id: format!("{}:{}", template.exit_id, merged),
+                        highway: template.highway.clone(),
+                        graph_node: template.graph_node,
+                        ref_val: Some(merged),
+                        name: template.name.clone(),
+                        lat: template.lat,
+                        lon: template.lon,
+                    });
+                }
+            }
+        }
     }
 
     let mut result = exits;
