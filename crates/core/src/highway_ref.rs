@@ -51,11 +51,13 @@ fn parse_interstate(s: &str) -> Option<&str> {
     if num_end == 0 {
         return None;
     }
-    // Must consume entire string
-    if num_end != rest.len() {
+    // Allow trailing " EXPR" suffix (express lanes share the main route number)
+    let after_num = &rest[num_end..];
+    if !after_num.is_empty() && !after_num.eq_ignore_ascii_case(b" EXPR") {
         return None;
     }
-    std::str::from_utf8(rest).ok()
+    // Return only the number portion (strip EXPR suffix)
+    std::str::from_utf8(&rest[..num_end]).ok()
 }
 
 fn parse_us_route(s: &str) -> Option<&str> {
@@ -139,6 +141,8 @@ mod tests {
         assert_eq!(normalize_highway_ref("I95"), Some("I-95".into()));
         assert_eq!(normalize_highway_ref("I - 95"), Some("I-95".into()));
         assert_eq!(normalize_highway_ref("i 10"), Some("I-10".into()));
+        assert_eq!(normalize_highway_ref("I 210 EXPR"), Some("I-210".into()));
+        assert_eq!(normalize_highway_ref("I 405 EXPR"), Some("I-405".into()));
     }
 
     #[test]
