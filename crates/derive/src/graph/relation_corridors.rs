@@ -1426,6 +1426,36 @@ fn expand_nodes_with_adjacent_ways(
     route_highway: &str,
     ways_by_id: &HashMap<i64, RouteWay>,
 ) -> HashSet<i64> {
+    // Build a node → (lat, lon) lookup from way geometries.
+    let mut node_coords: HashMap<i64, (f64, f64)> = HashMap::new();
+    for way in ways_by_id.values() {
+        for (idx, &node_id) in way.nodes.iter().enumerate() {
+            if idx < way.geometry.len() {
+                node_coords.insert(node_id, way.geometry[idx]);
+            }
+        }
+    }
+
+    // Compute spatial bounding box from assigned nodes (with 2km ≈ 0.02° buffer)
+    // to prevent the BFS from chaining through distant interchange link-ways.
+    const BBOX_BUFFER_DEG: f64 = 0.02;
+    let mut min_lat = f64::MAX;
+    let mut max_lat = f64::MIN;
+    let mut min_lon = f64::MAX;
+    let mut max_lon = f64::MIN;
+    for &node_id in assigned_nodes {
+        if let Some(&(lat, lon)) = node_coords.get(&node_id) {
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
+        }
+    }
+    min_lat -= BBOX_BUFFER_DEG;
+    max_lat += BBOX_BUFFER_DEG;
+    min_lon -= BBOX_BUFFER_DEG;
+    max_lon += BBOX_BUFFER_DEG;
+
     let mut expanded = assigned_nodes.clone();
 
     // Three-hop expansion: first expand through same-ref and blank-link ways,
@@ -1445,7 +1475,14 @@ fn expand_nodes_with_adjacent_ways(
                 continue;
             }
             if way.nodes.iter().any(|node| frontier.contains(node)) {
-                expanded.extend(way.nodes.iter().copied());
+                // Spatial bound: only include nodes within the bounding box
+                for (&node_id, &(lat, _lon)) in
+                    way.nodes.iter().zip(way.geometry.iter())
+                {
+                    if lat >= min_lat && lat <= max_lat && _lon >= min_lon && _lon <= max_lon {
+                        expanded.insert(node_id);
+                    }
+                }
             }
         }
     }
@@ -1453,14 +1490,14 @@ fn expand_nodes_with_adjacent_ways(
 }
 
 /// Discover sibling exits by base number proximity. If the corridor has
-/// exit "100B", search for "100A", "100C", etc. within 2km in the full
+/// exit "100B", search for "100A", "100C", etc. within 3km in the full
 /// exit node set. This catches lettered sub-exits on separate ramp ways
 /// that aren't reachable through graph expansion.
 fn discover_sibling_exits(
     exits: Vec<ExitRow>,
     all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
 ) -> Vec<ExitRow> {
-    const MAX_DISTANCE_M: f64 = 5_000.0;
+    const MAX_DISTANCE_M: f64 = 3_000.0;
 
     // Collect base numbers and their positions from existing corridor exits
     let mut base_positions: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
@@ -1600,9 +1637,9 @@ fn discover_nearby_exits(
     route_segments: &[Vec<[f64; 2]>],
     highway: &str,
 ) -> Vec<ExitRow> {
-    const MAX_DISTANCE_M: f64 = 5_000.0;
-    // Approximate degree buffer for the bounding box pre-filter (~10km)
-    const BBOX_BUFFER_DEG: f64 = 0.10;
+    const MAX_DISTANCE_M: f64 = 3_000.0;
+    // Approximate degree buffer for the bounding box pre-filter (~6km)
+    const BBOX_BUFFER_DEG: f64 = 0.06;
 
     // Build bounding box from route geometry
     let mut min_lat = f64::MAX;
@@ -2078,16 +2115,17 @@ async fn build_graph_fallback_corridors(
     next_corridor_id: &mut i32,
     all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
 ) -> Result<Vec<CorridorDraft>, anyhow::Error> {
-    // Find highways with exit_corridors but no corridor
-    let orphan_rows: Vec<(String,)> = sqlx::query_as(
+    // Find highways with exit_corridors that don't have relation-backed drafts.
+    // We check against covered_highways (the in-memory draft list) rather than
+    // the corridors table, which may contain stale data from a previous run.
+    let all_ec_highways: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT ec.highway FROM exit_corridors ec \
-         WHERE ec.highway LIKE 'I-%' \
-           AND NOT EXISTS (SELECT 1 FROM corridors c WHERE c.highway = ec.highway)",
+         WHERE ec.highway LIKE 'I-%'",
     )
     .fetch_all(pool)
     .await?;
 
-    let orphan_highways: Vec<String> = orphan_rows
+    let orphan_highways: Vec<String> = all_ec_highways
         .into_iter()
         .map(|(hw,)| hw)
         .filter(|hw| !covered_highways.contains(hw))
@@ -2208,6 +2246,12 @@ async fn build_graph_fallback_corridors(
             // Also discover nearby exits
             let with_nearby =
                 discover_nearby_exits(with_siblings, all_exit_nodes, &segments, highway);
+
+            // Apply the same ref expansion as relation-backed corridors
+            let with_nearby = resolve_semicolon_refs(with_nearby);
+            let with_nearby = expand_compound_refs(with_nearby);
+            let with_nearby = expand_comma_refs(with_nearby);
+            let with_nearby = synthesize_merged_letter_refs(with_nearby);
 
             exits = with_nearby
                 .into_iter()
@@ -2515,9 +2559,12 @@ mod tests {
 
     use super::{
         allowed_refs_for_pair, allowed_refs_for_route, build_connector_graph,
-        connector_way_allowed_for_refs, filter_route_groups, prune_micro_route_segments,
-        shortest_connector_path_to_any, validate_edge_claims, ExitRow, HighwayEdgeRow, RouteWay,
-        SHORT_FALLBACK_CONNECTOR_MAX_COST_M,
+        connector_way_allowed_for_refs, discover_sibling_exits, expand_comma_refs,
+        expand_compound_refs, expand_nodes_with_adjacent_ways, filter_route_groups,
+        haversine_m, point_to_route_distance_m, point_to_segment_distance_m,
+        prune_micro_route_segments, resolve_semicolon_refs, shortest_connector_path_to_any,
+        synthesize_merged_letter_refs, validate_edge_claims, ExitNodeInfo, ExitRow,
+        HighwayEdgeRow, RouteWay, SHORT_FALLBACK_CONNECTOR_MAX_COST_M,
     };
     use crate::interstate_relations::{InterstateRelationMember, InterstateRouteGroup};
 
@@ -3251,5 +3298,227 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].ref_val.as_deref(), Some("5A"));
         assert_eq!(resolved[1].ref_val.as_deref(), Some("5B"));
+
+    // --- Tests for new geometry functions ---
+
+    #[test]
+    fn haversine_known_distance() {
+        // NYC (40.7128, -74.0060) to Los Angeles (34.0522, -118.2437) ≈ 3,944 km
+        let d = haversine_m(40.7128, -74.006, 34.0522, -118.2437);
+        assert!((d - 3_944_000.0).abs() < 50_000.0); // within 50km tolerance
+    }
+
+    #[test]
+    fn haversine_same_point_is_zero() {
+        assert_eq!(haversine_m(40.0, -74.0, 40.0, -74.0), 0.0);
+    }
+
+    #[test]
+    fn point_to_segment_on_endpoint() {
+        let d = point_to_segment_distance_m(40.0, -74.0, 40.0, -74.0, 41.0, -74.0);
+        assert!(d < 1.0);
+    }
+
+    #[test]
+    fn point_to_segment_perpendicular() {
+        // Point east of a north-south segment
+        let d = point_to_segment_distance_m(40.5, -73.99, 40.0, -74.0, 41.0, -74.0);
+        // Should be roughly the east-west distance at lat 40.5 for 0.01° ≈ 850m
+        assert!(d > 500.0 && d < 1500.0);
+    }
+
+    #[test]
+    fn point_to_route_distance_multi_segment() {
+        let segments = vec![
+            vec![[40.0, -74.0], [40.01, -74.0]],
+            vec![[40.02, -74.0], [40.03, -74.0]],
+        ];
+        // Point between the two segments
+        let d = point_to_route_distance_m(40.015, -74.0, &segments);
+        // Should be about 500m (midpoint between seg1 end and seg2 start)
+        assert!(d > 200.0 && d < 800.0);
+    }
+
+    // --- Tests for expand_nodes_with_adjacent_ways ---
+
+    #[test]
+    fn expand_nodes_respects_spatial_bounds() {
+        // Main highway way near origin
+        let main_way = route_way(
+            1,
+            &["I-10"],
+            &[100, 101, 102],
+            &[(30.0, -90.0), (30.001, -90.0), (30.002, -90.0)],
+            "motorway",
+            true,
+        );
+        // Nearby ramp link (should be included)
+        let nearby_link = route_way(
+            2,
+            &[],
+            &[102, 200, 201],
+            &[(30.002, -90.0), (30.003, -90.001), (30.004, -90.001)],
+            "motorway_link",
+            true,
+        );
+        // Distant ramp link connected through a chain (should be excluded by spatial bound)
+        let distant_link = route_way(
+            3,
+            &[],
+            &[201, 300, 301],
+            &[(30.004, -90.001), (31.0, -90.0), (31.5, -90.0)],
+            "motorway_link",
+            true,
+        );
+
+        let ways_by_id = HashMap::from([
+            (1, main_way),
+            (2, nearby_link),
+            (3, distant_link),
+        ]);
+        let assigned = HashSet::from([100, 101, 102]);
+
+        let expanded = expand_nodes_with_adjacent_ways(&assigned, "I-10", &ways_by_id);
+
+        // Nearby ramp nodes should be included
+        assert!(expanded.contains(&200));
+        // Distant node at lat 31.0/31.5 should be excluded (>2km bounding box)
+        assert!(!expanded.contains(&300));
+        assert!(!expanded.contains(&301));
+    }
+
+    // --- Tests for resolve_semicolon_refs ---
+
+    #[test]
+    fn resolve_semicolon_refs_splits_combined_ref() {
+        let exits = vec![ExitRow {
+            exit_id: "node/1".into(),
+            highway: "I-10".into(),
+            graph_node: 1,
+            ref_val: Some("143A;143B".into()),
+            name: None,
+            lat: 30.0,
+            lon: -90.0,
+        }];
+
+        let result = resolve_semicolon_refs(exits);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"143A"));
+        assert!(refs.contains(&"143B"));
+    }
+
+    // --- Tests for expand_compound_refs ---
+
+    #[test]
+    fn expand_compound_refs_expands_letter_range() {
+        let exits = vec![ExitRow {
+            exit_id: "node/2".into(),
+            highway: "I-95".into(),
+            graph_node: 2,
+            ref_val: Some("17A-B".into()),
+            name: None,
+            lat: 40.0,
+            lon: -74.0,
+        }];
+
+        let result = expand_compound_refs(exits);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"17A"));
+        assert!(refs.contains(&"17B"));
+    }
+
+    // --- Tests for expand_comma_refs ---
+
+    #[test]
+    fn expand_comma_refs_splits_comma_pair() {
+        let exits = vec![ExitRow {
+            exit_id: "node/3".into(),
+            highway: "I-40".into(),
+            graph_node: 3,
+            ref_val: Some("11A,B".into()),
+            name: None,
+            lat: 35.0,
+            lon: -85.0,
+        }];
+
+        let result = expand_comma_refs(exits);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"11A"));
+        assert!(refs.contains(&"11B"));
+    }
+
+    // --- Tests for synthesize_merged_letter_refs ---
+
+    #[test]
+    fn synthesize_merged_letter_refs_creates_combined_form() {
+        let exits = vec![
+            ExitRow {
+                exit_id: "node/10".into(),
+                highway: "I-75".into(),
+                graph_node: 10,
+                ref_val: Some("214A".into()),
+                name: None,
+                lat: 33.0,
+                lon: -84.0,
+            },
+            ExitRow {
+                exit_id: "node/11".into(),
+                highway: "I-75".into(),
+                graph_node: 11,
+                ref_val: Some("214B".into()),
+                name: None,
+                lat: 33.001,
+                lon: -84.0,
+            },
+        ];
+
+        let result = synthesize_merged_letter_refs(exits);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"214A"));
+        assert!(refs.contains(&"214B"));
+        assert!(refs.contains(&"214AB"));
+    }
+
+    // --- Tests for discover_sibling_exits ---
+
+    #[test]
+    fn discover_sibling_exits_finds_lettered_variant() {
+        let exits = vec![ExitRow {
+            exit_id: "node/50".into(),
+            highway: "I-95".into(),
+            graph_node: 50,
+            ref_val: Some("100B".into()),
+            name: None,
+            lat: 40.0,
+            lon: -74.0,
+        }];
+
+        let mut all_nodes = HashMap::new();
+        // Sibling 100A nearby (500m away)
+        all_nodes.insert(
+            51,
+            ExitNodeInfo {
+                ref_val: Some("100A".into()),
+                name: None,
+                lat: 40.004,
+                lon: -74.0,
+            },
+        );
+        // Distant 100C (should be excluded at 2km)
+        all_nodes.insert(
+            52,
+            ExitNodeInfo {
+                ref_val: Some("100C".into()),
+                name: None,
+                lat: 40.05,
+                lon: -74.0,
+            },
+        );
+
+        let result = discover_sibling_exits(exits, &all_nodes);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"100A"), "nearby sibling should be found");
+        assert!(refs.contains(&"100B"), "original exit should remain");
+        assert!(!refs.contains(&"100C"), "distant sibling should be excluded");
     }
 }

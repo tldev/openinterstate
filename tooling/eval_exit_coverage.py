@@ -448,7 +448,9 @@ def save_baseline(path: str, matched: set[tuple[str, str]], score: float):
                 "matched_pairs": sorted(matched),
             },
             f,
+            indent=2,
         )
+        f.write("\n")
 
 
 def main():
@@ -554,5 +556,82 @@ def main():
     sys.exit(0 if gates_passed else 1)
 
 
+def _run_self_tests():
+    """Run self-tests for normalize_ground_truth_ref and strip_highway_suffix."""
+    # --- normalize_ground_truth_ref tests ---
+    # Ampersand: "99A&B" → ["99A", "99B"]
+    alts = normalize_ground_truth_ref("99A&B")
+    assert "99A" in alts and "99B" in alts, f"ampersand: {alts}"
+
+    # Comma: "11A,B" → ["11A", "11B"]
+    alts = normalize_ground_truth_ref("11A,B")
+    assert "11A" in alts and "11B" in alts, f"comma: {alts}"
+
+    # Slash (full numbers): "228/229" → ["228", "229"]
+    alts = normalize_ground_truth_ref("228/229")
+    assert "228" in alts and "229" in alts, f"slash: {alts}"
+
+    # Slash (letters): "13A/B" → ["13A", "13B"]
+    alts = normalize_ground_truth_ref("13A/B")
+    assert "13A" in alts and "13B" in alts, f"slash letters: {alts}"
+
+    # Semicolon: "143A;143B" → ["143A", "143B"]
+    alts = normalize_ground_truth_ref("143A;143B")
+    assert "143A" in alts and "143B" in alts, f"semicolon: {alts}"
+
+    # Dash-range full refs: "1A-1B" → ["1A", "1B"]
+    alts = normalize_ground_truth_ref("1A-1B")
+    assert "1A" in alts and "1B" in alts, f"dash-range: {alts}"
+
+    # Letter-range: "108A-B" → ["108A", "108B"]
+    alts = normalize_ground_truth_ref("108A-B")
+    assert "108A" in alts and "108B" in alts, f"letter-range: {alts}"
+
+    # Concatenated: "214AB" → ["214A", "214B"]
+    alts = normalize_ground_truth_ref("214AB")
+    assert "214A" in alts and "214B" in alts, f"concat: {alts}"
+
+    # Directional suffix: "29N" → ["29"]
+    alts = normalize_ground_truth_ref("29N")
+    assert "29" in alts, f"directional: {alts}"
+
+    # Question-mark: "4A?B" → ["4A", "4B"]
+    alts = normalize_ground_truth_ref("4A?B")
+    assert "4A" in alts and "4B" in alts, f"question-mark: {alts}"
+
+    # "X to Y": "68A to 1A" → ["68A", "1A"]
+    alts = normalize_ground_truth_ref("68A to 1A")
+    assert "68A" in alts and "1A" in alts, f"to-pattern: {alts}"
+
+    # Leading-number: "437 Frontage Rd" → ["437"]
+    alts = normalize_ground_truth_ref("437 Frontage Rd")
+    assert "437" in alts, f"leading-number: {alts}"
+
+    # Plain number should return empty (no normalization needed)
+    alts = normalize_ground_truth_ref("42")
+    assert alts == [], f"plain number: {alts}"
+
+    # --- strip_highway_suffix tests ---
+    assert strip_highway_suffix("I-35E") == "I-35"
+    assert strip_highway_suffix("I-35W") == "I-35"
+    assert strip_highway_suffix("I-69C") == "I-69"
+    assert strip_highway_suffix("I-95A") is None, "spur route should not be stripped"
+    assert strip_highway_suffix("I-95") is None
+    assert strip_highway_suffix("I-10") is None
+
+    # --- _is_non_exit_ref tests ---
+    assert _is_non_exit_ref("Rest Area 42")
+    assert _is_non_exit_ref("Truck Parking")
+    assert _is_non_exit_ref("toward I-10")
+    assert _is_non_exit_ref("to I-95 exit 5")
+    assert not _is_non_exit_ref("42A")
+    assert not _is_non_exit_ref("100")
+
+    print("All self-tests passed.")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        _run_self_tests()
+    else:
+        main()
