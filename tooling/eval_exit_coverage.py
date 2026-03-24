@@ -168,6 +168,13 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
         alts.append(to_match.group(1))
         alts.append(to_match.group(2))
 
+    # Leading-number extraction: "437 I-35W" → "437"
+    # For refs that start with a number followed by non-numeric text
+    if not alts:
+        m = re.match(r"^(\d+[A-Z]?)\s+\S", ref_val)
+        if m:
+            alts.append(m.group(1))
+
     return alts
 
 
