@@ -51,12 +51,13 @@ fn parse_interstate(s: &str) -> Option<&str> {
     if num_end == 0 {
         return None;
     }
-    // Allow trailing " EXPR" suffix (express lanes share the main route number)
+    // Allow suffixes for express/managed lanes that share the main route number.
+    // These are physically parallel to the mainline and share exit numbering.
     let after_num = &rest[num_end..];
-    if !after_num.is_empty() && !after_num.eq_ignore_ascii_case(b" EXPR") {
+    if !after_num.is_empty() && !is_interstate_lane_suffix(after_num) {
         return None;
     }
-    // Return only the number portion (strip EXPR suffix)
+    // Return only the number portion (strip suffix)
     std::str::from_utf8(&rest[..num_end]).ok()
 }
 
@@ -106,6 +107,32 @@ fn parse_state_route(s: &str) -> Option<(&str, &str, bool)> {
     Some((state, num_part, toll))
 }
 
+/// Check if the suffix after the route number denotes a managed-lane variant
+/// (express, HOV, TEXpress, etc.) that shares the main route's exit numbering.
+fn is_interstate_lane_suffix(suffix: &[u8]) -> bool {
+    const SUFFIXES: &[&[u8]] = &[
+        b" EXPR",
+        b" Express",
+        b" HOV",
+        b" TEXpress",
+        b" Flex",
+        b" Local",
+    ];
+    for &s in SUFFIXES {
+        if suffix.eq_ignore_ascii_case(s) {
+            return true;
+        }
+    }
+    // Also handle compass-direction suffixes: " North", " South", " East", " West"
+    const DIRS: &[&[u8]] = &[b" North", b" South", b" East", b" West"];
+    for &d in DIRS {
+        if suffix.eq_ignore_ascii_case(d) {
+            return true;
+        }
+    }
+    false
+}
+
 fn skip_separator(bytes: &[u8]) -> &[u8] {
     let mut slice = bytes;
     while matches!(slice.first(), Some(b'-' | b' ')) {
@@ -143,6 +170,15 @@ mod tests {
         assert_eq!(normalize_highway_ref("i 10"), Some("I-10".into()));
         assert_eq!(normalize_highway_ref("I 210 EXPR"), Some("I-210".into()));
         assert_eq!(normalize_highway_ref("I 405 EXPR"), Some("I-405".into()));
+        assert_eq!(normalize_highway_ref("I 25 Express"), Some("I-25".into()));
+        assert_eq!(normalize_highway_ref("I 30 HOV"), Some("I-30".into()));
+        assert_eq!(normalize_highway_ref("I 635 TEXpress"), Some("I-635".into()));
+        assert_eq!(normalize_highway_ref("I 195 East"), Some("I-195".into()));
+        assert_eq!(normalize_highway_ref("I 680 South"), Some("I-680".into()));
+        assert_eq!(normalize_highway_ref("I 80 Local"), Some("I-80".into()));
+        // Business/Toll/Alt should NOT normalize as Interstate
+        assert!(!is_interstate_highway_ref("I 80 BUS"));
+        assert!(!is_interstate_highway_ref("I 40 Business"));
     }
 
     #[test]

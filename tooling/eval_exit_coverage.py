@@ -230,6 +230,12 @@ def match_with_normalization(
         if _ref_in_oi(hw, ref, oi_pairs):
             matched.add((hw, ref))
 
+    # Decimal exit floor-matching: "58.5" → "58"
+    for hw, ref in ground_truth_pairs - matched:
+        m = re.match(r"^(\d+)\.\d+$", ref)
+        if m and (hw, m.group(1)) in oi_pairs:
+            matched.add((hw, ref))
+
     # Highway suffix aliasing: I-35W exit 25A → I-35 exit 25A
     # Some highways have directional suffixes that OI stores under the base name.
     for hw, ref in ground_truth_pairs - matched:
