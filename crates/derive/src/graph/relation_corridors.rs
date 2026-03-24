@@ -198,7 +198,25 @@ pub async fn build_corridors(
         drafts.push(draft);
     }
 
-    let drafts = dedup_conflicting_corridors(drafts);
+    let mut drafts = dedup_conflicting_corridors(drafts);
+
+    // Build fallback corridors from graph data for Interstate highways that
+    // have exit_corridors entries but no relation-backed corridor.
+    let covered_highways: HashSet<String> = drafts.iter().map(|d| d.highway.clone()).collect();
+    let fallback_drafts = build_graph_fallback_corridors(
+        pool,
+        &covered_highways,
+        &mut next_corridor_id,
+        &all_exit_nodes,
+    )
+    .await?;
+    if !fallback_drafts.is_empty() {
+        tracing::info!(
+            "Built {} graph-only fallback corridors",
+            fallback_drafts.len()
+        );
+        drafts.extend(fallback_drafts);
+    }
 
     write_corridors(pool, &drafts).await
 }
@@ -2049,6 +2067,203 @@ fn dedup_conflicting_corridors(drafts: Vec<CorridorDraft>) -> Vec<CorridorDraft>
     }
 
     kept
+}
+
+/// Build fallback corridors from graph data for Interstate highways that have
+/// `exit_corridors` entries but no relation-backed corridor. Groups edges by
+/// component and direction, then creates a simple corridor per group.
+async fn build_graph_fallback_corridors(
+    pool: &PgPool,
+    covered_highways: &HashSet<String>,
+    next_corridor_id: &mut i32,
+    all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
+) -> Result<Vec<CorridorDraft>, anyhow::Error> {
+    // Find highways with exit_corridors but no corridor
+    let orphan_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT ec.highway FROM exit_corridors ec \
+         WHERE ec.highway LIKE 'I-%' \
+           AND NOT EXISTS (SELECT 1 FROM corridors c WHERE c.highway = ec.highway)",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let orphan_highways: Vec<String> = orphan_rows
+        .into_iter()
+        .map(|(hw,)| hw)
+        .filter(|hw| !covered_highways.contains(hw))
+        .collect();
+
+    if orphan_highways.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut drafts = Vec::new();
+    for highway in &orphan_highways {
+        // Load edges for this highway
+        let edge_rows: Vec<(String, Option<String>, i32, String, String)> = sqlx::query_as(
+            "SELECT id, direction, component, polyline_json, source_way_ids_json \
+             FROM highway_edges WHERE highway = $1",
+        )
+        .bind(highway)
+        .fetch_all(pool)
+        .await?;
+
+        if edge_rows.is_empty() {
+            continue;
+        }
+
+        // Group edges by (component, direction)
+        let mut groups: HashMap<(i32, String), Vec<(String, String, String)>> = HashMap::new();
+        for (edge_id, direction, component, polyline_json, source_way_ids_json) in edge_rows {
+            let dir = direction.unwrap_or_else(|| "north".to_string());
+            groups
+                .entry((component, dir))
+                .or_default()
+                .push((edge_id, polyline_json, source_way_ids_json));
+        }
+
+        // Load exit_corridors for this highway
+        let exit_rows: Vec<(String, i64, Option<String>, Option<String>, f64, f64)> =
+            sqlx::query_as(
+                "SELECT ec.exit_id, ec.graph_node, e.ref, e.name, \
+                        ST_Y(e.geom) AS lat, ST_X(e.geom) AS lon \
+                 FROM exit_corridors ec \
+                 JOIN exits e ON e.id = ec.exit_id \
+                 WHERE ec.highway = $1",
+            )
+            .bind(highway)
+            .fetch_all(pool)
+            .await?;
+
+        // Build exit nodes set for proximity discovery
+        let ec_node_ids: HashSet<i64> = exit_rows.iter().map(|r| r.1).collect();
+
+        for ((component, direction), edges) in &groups {
+            let edge_ids: Vec<String> = edges.iter().map(|(id, _, _)| id.clone()).collect();
+            let mut source_way_ids: Vec<i64> = Vec::new();
+            let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
+
+            for (_, polyline_json, way_ids_json) in edges {
+                source_way_ids.extend(parse_way_ids_json(way_ids_json));
+                if let Ok(coords) = serde_json::from_str::<Vec<Vec<f64>>>(polyline_json) {
+                    let segment: Vec<[f64; 2]> = coords
+                        .iter()
+                        .filter_map(|pair| {
+                            if pair.len() >= 2 {
+                                Some([pair[1], pair[0]]) // [lat, lon]
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !segment.is_empty() {
+                        segments.push(segment);
+                    }
+                }
+            }
+
+            source_way_ids.sort();
+            source_way_ids.dedup();
+
+            // Sort segments by projection along the canonical direction
+            segments.sort_by(|a, b| {
+                segment_sort_key(a, direction)
+                    .partial_cmp(&segment_sort_key(b, direction))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let geometry_json = serialize_geometry_geojson(&segments)?;
+
+            // Build exits from exit_corridors entries for this component
+            let mut exits: Vec<CorridorExitDraft> = Vec::new();
+            for (exit_id, graph_node, ref_val, name, lat, lon) in &exit_rows {
+                if ec_node_ids.contains(graph_node) {
+                    let sort_key = projection_for_direction([*lat, *lon], direction);
+                    exits.push(CorridorExitDraft {
+                        exit_id: exit_id.clone(),
+                        ref_val: ref_val.clone(),
+                        name: name.clone(),
+                        lat: *lat,
+                        lon: *lon,
+                        sort_key_m: sort_key,
+                    });
+                }
+            }
+
+            // Discover sibling exits (e.g. "100A" if we have "100B")
+            let as_exit_rows: Vec<ExitRow> = exits
+                .iter()
+                .map(|e| ExitRow {
+                    exit_id: e.exit_id.clone(),
+                    highway: highway.clone(),
+                    graph_node: 0,
+                    ref_val: e.ref_val.clone(),
+                    name: e.name.clone(),
+                    lat: e.lat,
+                    lon: e.lon,
+                })
+                .collect();
+            let with_siblings = discover_sibling_exits(as_exit_rows, all_exit_nodes);
+
+            // Also discover nearby exits
+            let with_nearby =
+                discover_nearby_exits(with_siblings, all_exit_nodes, &segments, highway);
+
+            exits = with_nearby
+                .into_iter()
+                .map(|e| {
+                    let sort_key = projection_for_direction([e.lat, e.lon], direction);
+                    CorridorExitDraft {
+                        exit_id: e.exit_id,
+                        ref_val: e.ref_val,
+                        name: e.name,
+                        lat: e.lat,
+                        lon: e.lon,
+                        sort_key_m: sort_key,
+                    }
+                })
+                .collect();
+
+            // Sort exits along the corridor direction
+            exits.sort_by(|a, b| {
+                a.sort_key_m
+                    .partial_cmp(&b.sort_key_m)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Dedup exits by exit_id
+            let mut seen = HashSet::new();
+            exits.retain(|e| seen.insert(e.exit_id.clone()));
+
+            if exits.is_empty() {
+                continue;
+            }
+
+            let corridor_id = *next_corridor_id;
+            *next_corridor_id += 1;
+
+            tracing::info!(
+                highway = %highway,
+                direction = %direction,
+                component = component,
+                exit_count = exits.len(),
+                "graph-only fallback corridor"
+            );
+
+            drafts.push(CorridorDraft {
+                corridor_id,
+                highway: highway.clone(),
+                canonical_direction: direction.clone(),
+                root_relation_id: 0,
+                geometry_json,
+                source_way_ids,
+                edge_ids,
+                exits,
+            });
+        }
+    }
+
+    Ok(drafts)
 }
 
 async fn write_corridors(

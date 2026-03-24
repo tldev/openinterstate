@@ -17,6 +17,12 @@ pub fn normalize_highway_ref(raw: &str) -> Option<String> {
 
     // State route: NC-40, NC 40, NC40
     if let Some((state, num, toll)) = parse_state_route(&s) {
+        // Check for known state routes that are de facto Interstates
+        if !toll {
+            if let Some(alias) = interstate_route_alias(state, num) {
+                return Some(alias);
+            }
+        }
         let suffix = if toll { " Toll" } else { "" };
         return Some(format!(
             "{}-{}{}",
@@ -105,6 +111,18 @@ fn parse_state_route(s: &str) -> Option<(&str, &str, bool)> {
         return None;
     }
     Some((state, num_part, toll))
+}
+
+/// Return an Interstate alias for state routes that are de facto Interstates.
+/// These are routes where the state designation and Interstate designation refer
+/// to the same physical road (e.g., CA-210 = I-210 in California).
+fn interstate_route_alias(state: &str, num: &str) -> Option<String> {
+    let s = state.to_ascii_uppercase();
+    match (s.as_str(), num) {
+        ("CA", "210") => Some("I-210".to_string()),
+        ("VA", "164") => Some("I-164".to_string()),
+        _ => None,
+    }
 }
 
 /// Check if the suffix after the route number denotes a managed-lane variant
@@ -206,6 +224,19 @@ mod tests {
     #[test]
     fn test_suffix_letter() {
         assert_eq!(normalize_highway_ref("I-95A"), Some("I-95A".into()));
+    }
+
+    #[test]
+    fn test_interstate_route_alias() {
+        assert_eq!(normalize_highway_ref("CA 210"), Some("I-210".into()));
+        assert_eq!(normalize_highway_ref("CA-210"), Some("I-210".into()));
+        assert_eq!(normalize_highway_ref("VA 164"), Some("I-164".into()));
+        assert_eq!(normalize_highway_ref("VA-164"), Some("I-164".into()));
+        // Non-aliased state routes remain unchanged
+        assert_eq!(normalize_highway_ref("NC 40"), Some("NC-40".into()));
+        assert_eq!(normalize_highway_ref("CA 99"), Some("CA-99".into()));
+        // Aliased routes should be recognized as Interstate
+        assert!(is_interstate_highway_ref("I-210"));
     }
 
     #[test]

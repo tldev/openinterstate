@@ -178,6 +178,15 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
     return alts
 
 
+def _is_non_exit_ref(ref: str) -> bool:
+    """Return True for ground truth sign_numbers that aren't real exit numbers."""
+    lowered = ref.lower()
+    return any(
+        kw in lowered
+        for kw in ("rest area", "truck parking", "port of entry", "toward ", "to i-")
+    )
+
+
 def load_ground_truth_pairs() -> set[tuple[str, str]]:
     conn = sqlite3.connect(GROUND_TRUTH_DB)
     rows = conn.execute(
@@ -194,7 +203,12 @@ def load_ground_truth_pairs() -> set[tuple[str, str]]:
         """
     ).fetchall()
     conn.close()
-    return {(dn, sn.strip()) for dn, sn in rows}
+    pairs = set()
+    for dn, sn in rows:
+        ref = sn.strip()
+        if ref and not _is_non_exit_ref(ref):
+            pairs.add((dn, ref))
+    return pairs
 
 
 def _ref_in_oi(hw: str, ref: str, oi_pairs: set[tuple[str, str]]) -> bool:
@@ -282,7 +296,7 @@ def _match_by_proximity(
              * math.sin(dlon / 2) ** 2)
         return R * 2 * math.asin(math.sqrt(a))
 
-    MAX_DISTANCE_M = 350.0
+    MAX_DISTANCE_M = 500.0
 
     # Load ground truth exit locations
     conn = sqlite3.connect(GROUND_TRUTH_DB)
