@@ -149,6 +149,25 @@ def normalize_ground_truth_ref(ref_val: str) -> list[str]:
     if m:
         alts.append(m.group(1))
 
+    # Question-mark as separator: "4A?B" → "4A","4B"
+    if "?" in ref_val and not alts:
+        parts = [p.strip() for p in ref_val.split("?") if p.strip()]
+        if len(parts) >= 2:
+            first = parts[0]
+            m = re.match(r"^(\d+)", first)
+            base = m.group(1) if m else ""
+            for p in parts:
+                if re.match(r"^\d", p):
+                    alts.append(p)
+                elif base:
+                    alts.append(f"{base}{p}")
+
+    # "X to Y" pattern: "68A to 1A" → "68A","1A"
+    to_match = re.match(r"^(\d+[A-Z]?)\s+to\s+(\d+[A-Z]?)$", ref_val, re.IGNORECASE)
+    if to_match and not alts:
+        alts.append(to_match.group(1))
+        alts.append(to_match.group(2))
+
     return alts
 
 
@@ -209,6 +228,13 @@ def match_with_normalization(
     # bare number where ground truth splits the interchange into A/B/C.
     for hw, ref in ground_truth_pairs - matched:
         if _ref_in_oi(hw, ref, oi_pairs):
+            matched.add((hw, ref))
+
+    # Highway suffix aliasing: I-35W exit 25A → I-35 exit 25A
+    # Some highways have directional suffixes that OI stores under the base name.
+    for hw, ref in ground_truth_pairs - matched:
+        base_hw = strip_highway_suffix(hw)
+        if base_hw and _ref_in_oi(base_hw, ref, oi_pairs):
             matched.add((hw, ref))
 
     return matched
