@@ -17,6 +17,12 @@ pub fn normalize_highway_ref(raw: &str) -> Option<String> {
 
     // State route: NC-40, NC 40, NC40
     if let Some((state, num, toll)) = parse_state_route(&s) {
+        // Check for known state routes that are de facto Interstates
+        if !toll {
+            if let Some(alias) = interstate_route_alias(state, num) {
+                return Some(alias);
+            }
+        }
         let suffix = if toll { " Toll" } else { "" };
         return Some(format!(
             "{}-{}{}",
@@ -51,11 +57,14 @@ fn parse_interstate(s: &str) -> Option<&str> {
     if num_end == 0 {
         return None;
     }
-    // Must consume entire string
-    if num_end != rest.len() {
+    // Allow suffixes for express/managed lanes that share the main route number.
+    // These are physically parallel to the mainline and share exit numbering.
+    let after_num = &rest[num_end..];
+    if !after_num.is_empty() && !is_interstate_lane_suffix(after_num) {
         return None;
     }
-    std::str::from_utf8(rest).ok()
+    // Return only the number portion (strip suffix)
+    std::str::from_utf8(&rest[..num_end]).ok()
 }
 
 fn parse_us_route(s: &str) -> Option<&str> {
@@ -104,6 +113,44 @@ fn parse_state_route(s: &str) -> Option<(&str, &str, bool)> {
     Some((state, num_part, toll))
 }
 
+/// Return an Interstate alias for state routes that are de facto Interstates.
+/// These are routes where the state designation and Interstate designation refer
+/// to the same physical road (e.g., CA-210 = I-210 in California).
+fn interstate_route_alias(state: &str, num: &str) -> Option<String> {
+    let s = state.to_ascii_uppercase();
+    match (s.as_str(), num) {
+        ("CA", "210") => Some("I-210".to_string()),
+        ("VA", "164") => Some("I-164".to_string()),
+        _ => None,
+    }
+}
+
+/// Check if the suffix after the route number denotes a managed-lane variant
+/// (express, HOV, TEXpress, etc.) that shares the main route's exit numbering.
+fn is_interstate_lane_suffix(suffix: &[u8]) -> bool {
+    const SUFFIXES: &[&[u8]] = &[
+        b" EXPR",
+        b" Express",
+        b" HOV",
+        b" TEXpress",
+        b" Flex",
+        b" Local",
+    ];
+    for &s in SUFFIXES {
+        if suffix.eq_ignore_ascii_case(s) {
+            return true;
+        }
+    }
+    // Also handle compass-direction suffixes: " North", " South", " East", " West"
+    const DIRS: &[&[u8]] = &[b" North", b" South", b" East", b" West"];
+    for &d in DIRS {
+        if suffix.eq_ignore_ascii_case(d) {
+            return true;
+        }
+    }
+    false
+}
+
 fn skip_separator(bytes: &[u8]) -> &[u8] {
     let mut slice = bytes;
     while matches!(slice.first(), Some(b'-' | b' ')) {
@@ -139,6 +186,17 @@ mod tests {
         assert_eq!(normalize_highway_ref("I95"), Some("I-95".into()));
         assert_eq!(normalize_highway_ref("I - 95"), Some("I-95".into()));
         assert_eq!(normalize_highway_ref("i 10"), Some("I-10".into()));
+        assert_eq!(normalize_highway_ref("I 210 EXPR"), Some("I-210".into()));
+        assert_eq!(normalize_highway_ref("I 405 EXPR"), Some("I-405".into()));
+        assert_eq!(normalize_highway_ref("I 25 Express"), Some("I-25".into()));
+        assert_eq!(normalize_highway_ref("I 30 HOV"), Some("I-30".into()));
+        assert_eq!(normalize_highway_ref("I 635 TEXpress"), Some("I-635".into()));
+        assert_eq!(normalize_highway_ref("I 195 East"), Some("I-195".into()));
+        assert_eq!(normalize_highway_ref("I 680 South"), Some("I-680".into()));
+        assert_eq!(normalize_highway_ref("I 80 Local"), Some("I-80".into()));
+        // Business/Toll/Alt should NOT normalize as Interstate
+        assert!(!is_interstate_highway_ref("I 80 BUS"));
+        assert!(!is_interstate_highway_ref("I 40 Business"));
     }
 
     #[test]
@@ -166,6 +224,19 @@ mod tests {
     #[test]
     fn test_suffix_letter() {
         assert_eq!(normalize_highway_ref("I-95A"), Some("I-95A".into()));
+    }
+
+    #[test]
+    fn test_interstate_route_alias() {
+        assert_eq!(normalize_highway_ref("CA 210"), Some("I-210".into()));
+        assert_eq!(normalize_highway_ref("CA-210"), Some("I-210".into()));
+        assert_eq!(normalize_highway_ref("VA 164"), Some("I-164".into()));
+        assert_eq!(normalize_highway_ref("VA-164"), Some("I-164".into()));
+        // Non-aliased state routes remain unchanged
+        assert_eq!(normalize_highway_ref("NC 40"), Some("NC-40".into()));
+        assert_eq!(normalize_highway_ref("CA 99"), Some("CA-99".into()));
+        // Aliased routes should be recognized as Interstate
+        assert!(is_interstate_highway_ref("I-210"));
     }
 
     #[test]

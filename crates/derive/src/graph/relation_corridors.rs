@@ -24,7 +24,7 @@ const CONNECTOR_HIGHWAY_TYPES: &[&str] = &[
     "tertiary_link",
     "service",
 ];
-const MIN_ROUTE_LENGTH_M: f64 = 50_000.0;
+const MIN_ROUTE_LENGTH_M: f64 = 3_000.0;
 const SHORT_FALLBACK_CONNECTOR_MAX_COST_M: u64 = 10_000;
 const DISCONNECTED_MICRO_SEGMENT_MAX_LENGTH_M: f64 = 2_000.0;
 const DISCONNECTED_MICRO_SEGMENT_MAX_SHARE: f64 = 0.05;
@@ -198,6 +198,26 @@ pub async fn build_corridors(
         drafts.push(draft);
     }
 
+    let mut drafts = dedup_conflicting_corridors(drafts);
+
+    // Build fallback corridors from graph data for Interstate highways that
+    // have exit_corridors entries but no relation-backed corridor.
+    let covered_highways: HashSet<String> = drafts.iter().map(|d| d.highway.clone()).collect();
+    let fallback_drafts = build_graph_fallback_corridors(
+        pool,
+        &covered_highways,
+        &mut next_corridor_id,
+        &all_exit_nodes,
+    )
+    .await?;
+    if !fallback_drafts.is_empty() {
+        tracing::info!(
+            "Built {} graph-only fallback corridors",
+            fallback_drafts.len()
+        );
+        drafts.extend(fallback_drafts);
+    }
+
     write_corridors(pool, &drafts).await
 }
 
@@ -208,39 +228,51 @@ fn filter_route_groups(groups: Vec<InterstateRouteGroup>) -> Vec<InterstateRoute
         .map(|group| (group.highway.clone(), group.root_relation_id))
         .collect();
 
-    let mut unresolved_by_root: HashMap<(String, i64), (BTreeSet<i64>, usize)> = HashMap::new();
+    // Count directional vs blank members per root to decide whether to keep blanks.
+    // If blank members vastly outnumber directional ones, the directional sub-relations
+    // are likely incomplete and the blank group is the real highway.
+    let mut directional_count_by_root: HashMap<(String, i64), usize> = HashMap::new();
+    let mut blank_count_by_root: HashMap<(String, i64), usize> = HashMap::new();
     for group in &groups {
-        if group.direction.is_some()
-            || !directional_roots.contains(&(group.highway.clone(), group.root_relation_id))
-        {
-            continue;
+        let key = (group.highway.clone(), group.root_relation_id);
+        if group.direction.is_some() {
+            *directional_count_by_root.entry(key).or_default() += group.members.len();
+        } else if directional_roots.contains(&key) {
+            *blank_count_by_root.entry(key).or_default() += group.members.len();
         }
-
-        let entry = unresolved_by_root
-            .entry((group.highway.clone(), group.root_relation_id))
-            .or_insert_with(|| (BTreeSet::new(), 0));
-        entry.1 += group.members.len();
-        for member in &group.members {
-            entry.0.insert(member.leaf_relation_id);
-        }
-    }
-
-    for ((highway, root_relation_id), (leaf_relation_ids, blank_member_count)) in unresolved_by_root
-    {
-        tracing::warn!(
-            highway = %highway,
-            root_relation_id,
-            ?leaf_relation_ids,
-            blank_member_count,
-            "dropping unresolved blank relation members for directional Interstate root"
-        );
     }
 
     groups
         .into_iter()
         .filter(|group| {
-            group.direction.is_some()
-                || !directional_roots.contains(&(group.highway.clone(), group.root_relation_id))
+            if group.direction.is_some() {
+                return true;
+            }
+            let key = (group.highway.clone(), group.root_relation_id);
+            if !directional_roots.contains(&key) {
+                return true;
+            }
+            // Keep blank group if it has more members than all directional groups combined
+            let dir_count = directional_count_by_root.get(&key).copied().unwrap_or(0);
+            let blank_count = blank_count_by_root.get(&key).copied().unwrap_or(0);
+            if blank_count > dir_count {
+                tracing::info!(
+                    highway = %group.highway,
+                    root_relation_id = group.root_relation_id,
+                    blank_count,
+                    dir_count,
+                    "keeping blank-direction group (outnumbers directional members)"
+                );
+                return true;
+            }
+            tracing::debug!(
+                highway = %group.highway,
+                root_relation_id = group.root_relation_id,
+                blank_count,
+                dir_count,
+                "dropping blank-direction group (directional members dominate)"
+            );
+            false
         })
         .collect()
 }
@@ -508,10 +540,47 @@ fn build_corridor_draft(
         }
     }
 
+    // Discover sibling exits: if we have "100B", look for nearby "100A", "100C"
+    // in the full exit node set. Siblings share the same base number and are
+    // within 5km of an existing corridor exit.
+    let corridor_exit_rows = discover_sibling_exits(corridor_exit_rows, all_exit_nodes);
+
+    // Discover exits near the corridor geometry but not reachable through
+    // graph expansion (e.g. exits on distant ramps or service roads).
+    let corridor_exit_rows = discover_nearby_exits(
+        corridor_exit_rows,
+        all_exit_nodes,
+        &route_segments,
+        &group.highway,
+    );
+
+    // Second proximity pass: also check exits near ALL ways with the same
+    // highway ref, not just the corridor's assigned ways. This catches exits
+    // in sections where the corridor geometry has gaps but the highway ways
+    // still exist in the graph.
+    let all_same_ref_segments: Vec<Vec<[f64; 2]>> = ways_by_id
+        .values()
+        .filter(|way| way.refs.iter().any(|r| r == &group.highway))
+        .map(|way| way.geometry.iter().map(|&(lat, lon)| [lat, lon]).collect())
+        .collect();
+    let corridor_exit_rows = if !all_same_ref_segments.is_empty() {
+        discover_nearby_exits(
+            corridor_exit_rows,
+            all_exit_nodes,
+            &all_same_ref_segments,
+            &group.highway,
+        )
+    } else {
+        corridor_exit_rows
+    };
+
     // Resolve semicolon-separated refs (e.g. "143A;143B" at a gore-point node).
     // Prefer individual ramp-level nodes when they exist; only keep the
     // gore-point split as fallback for ref values with no dedicated node.
     let corridor_exit_rows = resolve_semicolon_refs(corridor_exit_rows);
+    let corridor_exit_rows = expand_compound_refs(corridor_exit_rows);
+    let corridor_exit_rows = expand_comma_refs(corridor_exit_rows);
+    let corridor_exit_rows = synthesize_merged_letter_refs(corridor_exit_rows);
 
     // Only keep exits that have at least a ref (exit number) or a name.
     // Bare motorway_junction nodes with neither are not useful to downstream
@@ -1357,18 +1426,535 @@ fn expand_nodes_with_adjacent_ways(
     route_highway: &str,
     ways_by_id: &HashMap<i64, RouteWay>,
 ) -> HashSet<i64> {
-    let mut expanded = assigned_nodes.clone();
+    // Build a node → (lat, lon) lookup from way geometries.
+    let mut node_coords: HashMap<i64, (f64, f64)> = HashMap::new();
     for way in ways_by_id.values() {
-        let has_same_ref = way.refs.iter().any(|r| r == route_highway);
-        let is_blank_link = way.highway_type.ends_with("_link") && way.refs.is_empty();
-        if !has_same_ref && !is_blank_link {
-            continue;
+        for (idx, &node_id) in way.nodes.iter().enumerate() {
+            if idx < way.geometry.len() {
+                node_coords.insert(node_id, way.geometry[idx]);
+            }
         }
-        if way.nodes.iter().any(|node| assigned_nodes.contains(node)) {
-            expanded.extend(way.nodes.iter().copied());
+    }
+
+    // Compute spatial bounding box from assigned nodes (with 2km ≈ 0.02° buffer)
+    // to prevent the BFS from chaining through distant interchange link-ways.
+    const BBOX_BUFFER_DEG: f64 = 0.02;
+    let mut min_lat = f64::MAX;
+    let mut max_lat = f64::MIN;
+    let mut min_lon = f64::MAX;
+    let mut max_lon = f64::MIN;
+    for &node_id in assigned_nodes {
+        if let Some(&(lat, lon)) = node_coords.get(&node_id) {
+            min_lat = min_lat.min(lat);
+            max_lat = max_lat.max(lat);
+            min_lon = min_lon.min(lon);
+            max_lon = max_lon.max(lon);
+        }
+    }
+    min_lat -= BBOX_BUFFER_DEG;
+    max_lat += BBOX_BUFFER_DEG;
+    min_lon -= BBOX_BUFFER_DEG;
+    max_lon += BBOX_BUFFER_DEG;
+
+    let mut expanded = assigned_nodes.clone();
+
+    // Three-hop expansion: first expand through same-ref and blank-link ways,
+    // then expand twice more through blank-link ways only (catches ramps
+    // connected via intermediate junction nodes, including exits at the
+    // far end of longer ramp sequences).
+    for hop in 0..3 {
+        let frontier = expanded.clone();
+        for way in ways_by_id.values() {
+            let has_same_ref = way.refs.iter().any(|r| r == route_highway);
+            let is_blank_link = way.highway_type.ends_with("_link") && way.refs.is_empty();
+            // First hop: same-ref or blank links; second hop: blank links only
+            if hop == 0 && !has_same_ref && !is_blank_link {
+                continue;
+            }
+            if hop >= 1 && !is_blank_link {
+                continue;
+            }
+            if way.nodes.iter().any(|node| frontier.contains(node)) {
+                // Spatial bound: only include nodes within the bounding box
+                for (&node_id, &(lat, _lon)) in
+                    way.nodes.iter().zip(way.geometry.iter())
+                {
+                    if lat >= min_lat && lat <= max_lat && _lon >= min_lon && _lon <= max_lon {
+                        expanded.insert(node_id);
+                    }
+                }
+            }
         }
     }
     expanded
+}
+
+/// Discover sibling exits by base number proximity. If the corridor has
+/// exit "100B", search for "100A", "100C", etc. within 3km in the full
+/// exit node set. This catches lettered sub-exits on separate ramp ways
+/// that aren't reachable through graph expansion.
+fn discover_sibling_exits(
+    exits: Vec<ExitRow>,
+    all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
+) -> Vec<ExitRow> {
+    const MAX_DISTANCE_M: f64 = 3_000.0;
+
+    // Collect base numbers and their positions from existing corridor exits
+    let mut base_positions: HashMap<String, Vec<(f64, f64)>> = HashMap::new();
+    let mut known_refs: HashSet<String> = HashSet::new();
+    let mut known_node_ids: HashSet<i64> = HashSet::new();
+    let highway = exits.first().map(|e| e.highway.clone()).unwrap_or_default();
+
+    for exit in &exits {
+        known_node_ids.insert(exit.graph_node);
+        if let Some(ref r) = exit.ref_val {
+            known_refs.insert(r.clone());
+            // Extract base number (e.g., "100" from "100B")
+            let base = r
+                .trim_end_matches(|c: char| c.is_ascii_uppercase())
+                .to_string();
+            if !base.is_empty() && base.chars().all(|c| c.is_ascii_digit()) {
+                base_positions
+                    .entry(base)
+                    .or_default()
+                    .push((exit.lat, exit.lon));
+            }
+        }
+    }
+
+    // Build index of all exit nodes by their base number
+    let mut exits_by_base: HashMap<String, Vec<(i64, &ExitNodeInfo)>> = HashMap::new();
+    for (&node_id, info) in all_exit_nodes {
+        if known_node_ids.contains(&node_id) {
+            continue;
+        }
+        if let Some(ref r) = info.ref_val {
+            let base = r
+                .trim_end_matches(|c: char| c.is_ascii_uppercase())
+                .to_string();
+            if !base.is_empty() && base.chars().all(|c| c.is_ascii_digit()) {
+                exits_by_base
+                    .entry(base)
+                    .or_default()
+                    .push((node_id, info));
+            }
+        }
+    }
+
+    let mut new_exits = Vec::new();
+    for (base, positions) in &base_positions {
+        let Some(candidates) = exits_by_base.get(base) else {
+            continue;
+        };
+        for &(node_id, info) in candidates {
+            let ref_val = info.ref_val.as_deref().unwrap_or("");
+            if known_refs.contains(ref_val) {
+                continue;
+            }
+            // Check if the candidate is within MAX_DISTANCE_M of any existing exit
+            let close_enough = positions.iter().any(|&(lat, lon)| {
+                haversine_m(lat, lon, info.lat, info.lon) < MAX_DISTANCE_M
+            });
+            if close_enough {
+                new_exits.push(ExitRow {
+                    exit_id: format!("node/{}", node_id),
+                    highway: highway.clone(),
+                    graph_node: node_id,
+                    ref_val: info.ref_val.clone(),
+                    name: info.name.clone(),
+                    lat: info.lat,
+                    lon: info.lon,
+                });
+                known_refs.insert(ref_val.to_string());
+            }
+        }
+    }
+
+    let mut result = exits;
+    result.extend(new_exits);
+    result
+}
+
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let r = 6_371_000.0_f64;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * r * a.sqrt().asin()
+}
+
+/// Minimum distance from a point to a polyline segment (point-to-segment).
+fn point_to_segment_distance_m(
+    plat: f64,
+    plon: f64,
+    alat: f64,
+    alon: f64,
+    blat: f64,
+    blon: f64,
+) -> f64 {
+    // Project point onto segment in lat/lon space, then compute haversine
+    let dx = blon - alon;
+    let dy = blat - alat;
+    let len_sq = dx * dx + dy * dy;
+    if len_sq < 1e-16 {
+        return haversine_m(plat, plon, alat, alon);
+    }
+    let t = ((plon - alon) * dx + (plat - alat) * dy) / len_sq;
+    let t = t.clamp(0.0, 1.0);
+    let closest_lat = alat + t * dy;
+    let closest_lon = alon + t * dx;
+    haversine_m(plat, plon, closest_lat, closest_lon)
+}
+
+/// Minimum distance from a point to a route geometry (multi-segment polyline).
+fn point_to_route_distance_m(lat: f64, lon: f64, route_segments: &[Vec<[f64; 2]>]) -> f64 {
+    let mut min_dist = f64::MAX;
+    for segment in route_segments {
+        for window in segment.windows(2) {
+            let d = point_to_segment_distance_m(
+                lat,
+                lon,
+                window[0][0],
+                window[0][1],
+                window[1][0],
+                window[1][1],
+            );
+            if d < min_dist {
+                min_dist = d;
+            }
+        }
+    }
+    min_dist
+}
+
+/// Discover exit nodes near the corridor geometry that weren't found via
+/// graph expansion. Uses a bounding-box pre-filter then checks point-to-polyline
+/// distance. Catches exits on distant ramps or service roads.
+fn discover_nearby_exits(
+    exits: Vec<ExitRow>,
+    all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
+    route_segments: &[Vec<[f64; 2]>],
+    highway: &str,
+) -> Vec<ExitRow> {
+    const MAX_DISTANCE_M: f64 = 3_000.0;
+    // Approximate degree buffer for the bounding box pre-filter (~6km)
+    const BBOX_BUFFER_DEG: f64 = 0.06;
+
+    // Build bounding box from route geometry
+    let mut min_lat = f64::MAX;
+    let mut max_lat = f64::MIN;
+    let mut min_lon = f64::MAX;
+    let mut max_lon = f64::MIN;
+    for segment in route_segments {
+        for point in segment {
+            min_lat = min_lat.min(point[0]);
+            max_lat = max_lat.max(point[0]);
+            min_lon = min_lon.min(point[1]);
+            max_lon = max_lon.max(point[1]);
+        }
+    }
+    min_lat -= BBOX_BUFFER_DEG;
+    max_lat += BBOX_BUFFER_DEG;
+    min_lon -= BBOX_BUFFER_DEG;
+    max_lon += BBOX_BUFFER_DEG;
+
+    let known_nodes: HashSet<i64> = exits.iter().map(|e| e.graph_node).collect();
+    let mut known_refs: HashSet<String> = HashSet::new();
+    for exit in &exits {
+        if let Some(ref r) = exit.ref_val {
+            known_refs.insert(r.clone());
+        }
+    }
+
+    let mut new_exits = Vec::new();
+    for (&node_id, info) in all_exit_nodes {
+        if known_nodes.contains(&node_id) {
+            continue;
+        }
+        // Skip exits without a ref — we can't match them anyway
+        let Some(ref ref_val) = info.ref_val else {
+            continue;
+        };
+        if ref_val.is_empty() || known_refs.contains(ref_val) {
+            continue;
+        }
+        // Bounding box pre-filter
+        if info.lat < min_lat || info.lat > max_lat || info.lon < min_lon || info.lon > max_lon {
+            continue;
+        }
+        // Precise distance check
+        let dist = point_to_route_distance_m(info.lat, info.lon, route_segments);
+        if dist <= MAX_DISTANCE_M {
+            new_exits.push(ExitRow {
+                exit_id: format!("node/{}", node_id),
+                highway: highway.to_string(),
+                graph_node: node_id,
+                ref_val: info.ref_val.clone(),
+                name: info.name.clone(),
+                lat: info.lat,
+                lon: info.lon,
+            });
+            known_refs.insert(ref_val.clone());
+        }
+    }
+
+    let mut result = exits;
+    result.extend(new_exits);
+    result
+}
+
+/// Expand compound letter-range exits like "17A-B" into individual entries
+/// ("17A", "17B") while keeping the original compound form.
+fn expand_compound_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
+    let mut individual_refs: HashSet<String> = HashSet::new();
+    for exit in &exits {
+        if let Some(ref r) = exit.ref_val {
+            individual_refs.insert(r.clone());
+        }
+    }
+
+    let mut result = Vec::with_capacity(exits.len());
+    for exit in exits {
+        result.push(exit.clone());
+
+        let Some(ref ref_val) = exit.ref_val else {
+            continue;
+        };
+
+        // Match patterns like "17A-B", "17A-B-C", "17A-C"
+        let bytes = ref_val.as_bytes();
+        // Find the base number and letter range
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == 0 || i >= bytes.len() {
+            continue;
+        }
+        let base = &ref_val[..i];
+        let suffix = &ref_val[i..];
+
+        // Parse letter-dash-letter patterns: "A-B", "A-B-C", "A-C"
+        let letters: Vec<u8> = suffix
+            .split('-')
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.len() == 1 && s.as_bytes()[0].is_ascii_uppercase() {
+                    Some(s.as_bytes()[0])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if letters.len() < 2 {
+            continue;
+        }
+
+        let first = *letters.first().unwrap();
+        let last = *letters.last().unwrap();
+        // Support both "A-B" and reverse "B-A" ordering
+        let (start, end) = if first <= last {
+            (first, last)
+        } else {
+            (last, first)
+        };
+        if (end - start) > 5 {
+            continue;
+        }
+
+        for c in start..=end {
+            let expanded = format!("{}{}", base, c as char);
+            if individual_refs.contains(&expanded) {
+                continue; // Already exists as a dedicated exit
+            }
+            result.push(ExitRow {
+                exit_id: format!("{}:{}", exit.exit_id, expanded),
+                highway: exit.highway.clone(),
+                graph_node: exit.graph_node,
+                ref_val: Some(expanded),
+                name: exit.name.clone(),
+                lat: exit.lat,
+                lon: exit.lon,
+            });
+        }
+    }
+    result
+}
+
+/// Expand comma-separated exit refs like "11A,B" into "11A" and "11B",
+/// and "12A,12B" into individual entries. Keeps the original compound form.
+fn expand_comma_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
+    let mut individual_refs: HashSet<String> = HashSet::new();
+    for exit in &exits {
+        if let Some(ref r) = exit.ref_val {
+            if !r.contains(',') {
+                individual_refs.insert(r.clone());
+            }
+        }
+    }
+
+    let mut result = Vec::with_capacity(exits.len());
+    for exit in exits {
+        let Some(ref ref_val) = exit.ref_val else {
+            result.push(exit);
+            continue;
+        };
+        if !ref_val.contains(',') {
+            result.push(exit);
+            continue;
+        }
+
+        result.push(exit.clone()); // Keep original compound form
+
+        // Find the numeric base of the first part
+        let first_part = ref_val.split(',').next().unwrap_or("").trim();
+        let base_len = first_part
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        let base = &first_part[..base_len];
+
+        for part in ref_val.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+
+            // If the part starts with a digit, it's a full ref (e.g., "12A" in "12A,12B")
+            // If it's just letters, prepend the base (e.g., "B" in "11A,B" → "11B")
+            let expanded = if part.bytes().next().is_some_and(|b| b.is_ascii_digit()) {
+                part.to_string()
+            } else if !base.is_empty() {
+                format!("{}{}", base, part)
+            } else {
+                continue;
+            };
+
+            if individual_refs.contains(&expanded) {
+                continue;
+            }
+            result.push(ExitRow {
+                exit_id: format!("{}:{}", exit.exit_id, expanded),
+                highway: exit.highway.clone(),
+                graph_node: exit.graph_node,
+                ref_val: Some(expanded),
+                name: exit.name.clone(),
+                lat: exit.lat,
+                lon: exit.lon,
+            });
+        }
+    }
+    result
+}
+
+/// Synthesize merged letter refs like "214AB" from adjacent individual
+/// letter exits ("214A", "214B") at the same graph node. Many exit
+/// databases store the combined form rather than individual letters.
+fn synthesize_merged_letter_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
+    // Collect lettered exits by their base number and letter.
+    struct LetterEntry {
+        ch: char,
+        idx: usize,
+        node: i64,
+    }
+    let mut by_base: HashMap<String, Vec<LetterEntry>> = HashMap::new();
+    for (idx, exit) in exits.iter().enumerate() {
+        let Some(ref ref_val) = exit.ref_val else {
+            continue;
+        };
+        let bytes = ref_val.as_bytes();
+        if bytes.len() < 2 {
+            continue;
+        }
+        let last = *bytes.last().unwrap();
+        if !last.is_ascii_uppercase() {
+            continue;
+        }
+        let base = &ref_val[..ref_val.len() - 1];
+        if !base.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        by_base
+            .entry(base.to_string())
+            .or_default()
+            .push(LetterEntry {
+                ch: last as char,
+                idx,
+                node: exit.graph_node,
+            });
+    }
+
+    let existing_refs: HashSet<String> = exits
+        .iter()
+        .filter_map(|e| e.ref_val.clone())
+        .collect();
+
+    let mut new_exits = Vec::new();
+    for (base, entries) in &by_base {
+        // Strategy 1: group by node (preserves per-node merged forms like "1CD")
+        let mut by_node: HashMap<i64, Vec<&LetterEntry>> = HashMap::new();
+        for entry in entries {
+            by_node.entry(entry.node).or_default().push(entry);
+        }
+        for (_node, mut node_entries) in by_node {
+            if node_entries.len() < 2 {
+                continue;
+            }
+            node_entries.sort_by_key(|e| e.ch);
+            let merged = format!(
+                "{}{}",
+                base,
+                node_entries.iter().map(|e| e.ch).collect::<String>()
+            );
+            if existing_refs.contains(&merged) {
+                continue;
+            }
+            let template = &exits[node_entries[0].idx];
+            new_exits.push(ExitRow {
+                exit_id: format!("{}:{}", template.exit_id, merged),
+                highway: template.highway.clone(),
+                graph_node: template.graph_node,
+                ref_val: Some(merged),
+                name: template.name.clone(),
+                lat: template.lat,
+                lon: template.lon,
+            });
+        }
+
+        // Strategy 2: also generate the full merged form across all nodes
+        if entries.len() >= 2 {
+            let mut sorted: Vec<_> = entries.iter().collect();
+            sorted.sort_by_key(|e| e.ch);
+            sorted.dedup_by_key(|e| e.ch);
+            if sorted.len() >= 2 {
+                let merged = format!(
+                    "{}{}",
+                    base,
+                    sorted.iter().map(|e| e.ch).collect::<String>()
+                );
+                if !existing_refs.contains(&merged)
+                    && !new_exits.iter().any(|e| e.ref_val.as_deref() == Some(&merged))
+                {
+                    let template = &exits[sorted[0].idx];
+                    new_exits.push(ExitRow {
+                        exit_id: format!("{}:{}", template.exit_id, merged),
+                        highway: template.highway.clone(),
+                        graph_node: template.graph_node,
+                        ref_val: Some(merged),
+                        name: template.name.clone(),
+                        lat: template.lat,
+                        lon: template.lon,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut result = exits;
+    result.extend(new_exits);
+    result
 }
 
 fn matched_edge_ids(
@@ -1432,6 +2018,246 @@ fn validate_edge_claims(drafts: &[CorridorDraft]) -> Result<(), anyhow::Error> {
         }
     }
     Ok(())
+}
+
+/// Remove corridors that conflict on edge assignments with an earlier corridor.
+/// Corridors are processed in insertion order (by highway number, then root relation,
+/// then direction), so the first corridor for each highway claims edges first.
+fn dedup_conflicting_corridors(drafts: Vec<CorridorDraft>) -> Vec<CorridorDraft> {
+    let mut claimed_edges: HashMap<String, i64> = HashMap::new(); // edge_id -> root_relation_id
+    let mut kept = Vec::with_capacity(drafts.len());
+
+    for draft in drafts {
+        let has_conflict = draft.edge_ids.iter().any(|edge_id| {
+            claimed_edges
+                .get(edge_id)
+                .is_some_and(|&root| root != draft.root_relation_id)
+        });
+
+        if has_conflict {
+            tracing::warn!(
+                highway = %draft.highway,
+                direction = %draft.canonical_direction,
+                root_relation_id = draft.root_relation_id,
+                edge_count = draft.edge_ids.len(),
+                "dropping corridor with conflicting edge claims"
+            );
+            continue;
+        }
+
+        for edge_id in &draft.edge_ids {
+            claimed_edges
+                .entry(edge_id.clone())
+                .or_insert(draft.root_relation_id);
+        }
+        kept.push(draft);
+    }
+
+    kept
+}
+
+/// Build fallback corridors from graph data for Interstate highways that have
+/// `exit_corridors` entries but no relation-backed corridor. Groups edges by
+/// component and direction, then creates a simple corridor per group.
+async fn build_graph_fallback_corridors(
+    pool: &PgPool,
+    covered_highways: &HashSet<String>,
+    next_corridor_id: &mut i32,
+    all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
+) -> Result<Vec<CorridorDraft>, anyhow::Error> {
+    // Find highways with exit_corridors that don't have relation-backed drafts.
+    // We check against covered_highways (the in-memory draft list) rather than
+    // the corridors table, which may contain stale data from a previous run.
+    let all_ec_highways: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT ec.highway FROM exit_corridors ec \
+         WHERE ec.highway LIKE 'I-%'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let orphan_highways: Vec<String> = all_ec_highways
+        .into_iter()
+        .map(|(hw,)| hw)
+        .filter(|hw| !covered_highways.contains(hw))
+        .collect();
+
+    if orphan_highways.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut drafts = Vec::new();
+    for highway in &orphan_highways {
+        // Load edges for this highway
+        let edge_rows: Vec<(String, Option<String>, i32, String, String)> = sqlx::query_as(
+            "SELECT id, direction, component, polyline_json, source_way_ids_json \
+             FROM highway_edges WHERE highway = $1",
+        )
+        .bind(highway)
+        .fetch_all(pool)
+        .await?;
+
+        if edge_rows.is_empty() {
+            continue;
+        }
+
+        // Group edges by (component, direction)
+        let mut groups: HashMap<(i32, String), Vec<(String, String, String)>> = HashMap::new();
+        for (edge_id, direction, component, polyline_json, source_way_ids_json) in edge_rows {
+            let dir = direction.unwrap_or_else(|| "north".to_string());
+            groups
+                .entry((component, dir))
+                .or_default()
+                .push((edge_id, polyline_json, source_way_ids_json));
+        }
+
+        // Load exit_corridors for this highway
+        let exit_rows: Vec<(String, i64, Option<String>, Option<String>, f64, f64)> =
+            sqlx::query_as(
+                "SELECT ec.exit_id, ec.graph_node, e.ref, e.name, \
+                        ST_Y(e.geom) AS lat, ST_X(e.geom) AS lon \
+                 FROM exit_corridors ec \
+                 JOIN exits e ON e.id = ec.exit_id \
+                 WHERE ec.highway = $1",
+            )
+            .bind(highway)
+            .fetch_all(pool)
+            .await?;
+
+        // Build exit nodes set for proximity discovery
+        let ec_node_ids: HashSet<i64> = exit_rows.iter().map(|r| r.1).collect();
+
+        for ((component, direction), edges) in &groups {
+            let edge_ids: Vec<String> = edges.iter().map(|(id, _, _)| id.clone()).collect();
+            let mut source_way_ids: Vec<i64> = Vec::new();
+            let mut segments: Vec<Vec<[f64; 2]>> = Vec::new();
+
+            for (_, polyline_json, way_ids_json) in edges {
+                source_way_ids.extend(parse_way_ids_json(way_ids_json));
+                if let Ok(coords) = serde_json::from_str::<Vec<Vec<f64>>>(polyline_json) {
+                    let segment: Vec<[f64; 2]> = coords
+                        .iter()
+                        .filter_map(|pair| {
+                            if pair.len() >= 2 {
+                                Some([pair[1], pair[0]]) // [lat, lon]
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !segment.is_empty() {
+                        segments.push(segment);
+                    }
+                }
+            }
+
+            source_way_ids.sort();
+            source_way_ids.dedup();
+
+            // Sort segments by projection along the canonical direction
+            segments.sort_by(|a, b| {
+                segment_sort_key(a, direction)
+                    .partial_cmp(&segment_sort_key(b, direction))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let geometry_json = serialize_geometry_geojson(&segments)?;
+
+            // Build exits from exit_corridors entries for this component
+            let mut exits: Vec<CorridorExitDraft> = Vec::new();
+            for (exit_id, graph_node, ref_val, name, lat, lon) in &exit_rows {
+                if ec_node_ids.contains(graph_node) {
+                    let sort_key = projection_for_direction([*lat, *lon], direction);
+                    exits.push(CorridorExitDraft {
+                        exit_id: exit_id.clone(),
+                        ref_val: ref_val.clone(),
+                        name: name.clone(),
+                        lat: *lat,
+                        lon: *lon,
+                        sort_key_m: sort_key,
+                    });
+                }
+            }
+
+            // Discover sibling exits (e.g. "100A" if we have "100B")
+            let as_exit_rows: Vec<ExitRow> = exits
+                .iter()
+                .map(|e| ExitRow {
+                    exit_id: e.exit_id.clone(),
+                    highway: highway.clone(),
+                    graph_node: 0,
+                    ref_val: e.ref_val.clone(),
+                    name: e.name.clone(),
+                    lat: e.lat,
+                    lon: e.lon,
+                })
+                .collect();
+            let with_siblings = discover_sibling_exits(as_exit_rows, all_exit_nodes);
+
+            // Also discover nearby exits
+            let with_nearby =
+                discover_nearby_exits(with_siblings, all_exit_nodes, &segments, highway);
+
+            // Apply the same ref expansion as relation-backed corridors
+            let with_nearby = resolve_semicolon_refs(with_nearby);
+            let with_nearby = expand_compound_refs(with_nearby);
+            let with_nearby = expand_comma_refs(with_nearby);
+            let with_nearby = synthesize_merged_letter_refs(with_nearby);
+
+            exits = with_nearby
+                .into_iter()
+                .map(|e| {
+                    let sort_key = projection_for_direction([e.lat, e.lon], direction);
+                    CorridorExitDraft {
+                        exit_id: e.exit_id,
+                        ref_val: e.ref_val,
+                        name: e.name,
+                        lat: e.lat,
+                        lon: e.lon,
+                        sort_key_m: sort_key,
+                    }
+                })
+                .collect();
+
+            // Sort exits along the corridor direction
+            exits.sort_by(|a, b| {
+                a.sort_key_m
+                    .partial_cmp(&b.sort_key_m)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Dedup exits by exit_id
+            let mut seen = HashSet::new();
+            exits.retain(|e| seen.insert(e.exit_id.clone()));
+
+            if exits.is_empty() {
+                continue;
+            }
+
+            let corridor_id = *next_corridor_id;
+            *next_corridor_id += 1;
+
+            tracing::info!(
+                highway = %highway,
+                direction = %direction,
+                component = component,
+                exit_count = exits.len(),
+                "graph-only fallback corridor"
+            );
+
+            drafts.push(CorridorDraft {
+                corridor_id,
+                highway: highway.clone(),
+                canonical_direction: direction.clone(),
+                root_relation_id: 0,
+                geometry_json,
+                source_way_ids,
+                edge_ids,
+                exits,
+            });
+        }
+    }
+
+    Ok(drafts)
 }
 
 async fn write_corridors(
@@ -1683,9 +2509,12 @@ mod tests {
 
     use super::{
         allowed_refs_for_pair, allowed_refs_for_route, build_connector_graph,
-        connector_way_allowed_for_refs, filter_route_groups, prune_micro_route_segments,
-        shortest_connector_path_to_any, validate_edge_claims, ExitRow, HighwayEdgeRow, RouteWay,
-        SHORT_FALLBACK_CONNECTOR_MAX_COST_M,
+        connector_way_allowed_for_refs, discover_sibling_exits, expand_comma_refs,
+        expand_compound_refs, expand_nodes_with_adjacent_ways, filter_route_groups,
+        haversine_m, point_to_route_distance_m, point_to_segment_distance_m,
+        prune_micro_route_segments, resolve_semicolon_refs, shortest_connector_path_to_any,
+        synthesize_merged_letter_refs, validate_edge_claims, ExitNodeInfo, ExitRow,
+        HighwayEdgeRow, RouteWay, SHORT_FALLBACK_CONNECTOR_MAX_COST_M,
     };
     use crate::interstate_relations::{InterstateRelationMember, InterstateRouteGroup};
 
@@ -2419,5 +3248,228 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].ref_val.as_deref(), Some("5A"));
         assert_eq!(resolved[1].ref_val.as_deref(), Some("5B"));
+    }
+
+    // --- Tests for new geometry functions ---
+
+    #[test]
+    fn haversine_known_distance() {
+        // NYC (40.7128, -74.0060) to Los Angeles (34.0522, -118.2437) ≈ 3,944 km
+        let d = haversine_m(40.7128, -74.006, 34.0522, -118.2437);
+        assert!((d - 3_944_000.0).abs() < 50_000.0); // within 50km tolerance
+    }
+
+    #[test]
+    fn haversine_same_point_is_zero() {
+        assert_eq!(haversine_m(40.0, -74.0, 40.0, -74.0), 0.0);
+    }
+
+    #[test]
+    fn point_to_segment_on_endpoint() {
+        let d = point_to_segment_distance_m(40.0, -74.0, 40.0, -74.0, 41.0, -74.0);
+        assert!(d < 1.0);
+    }
+
+    #[test]
+    fn point_to_segment_perpendicular() {
+        // Point east of a north-south segment
+        let d = point_to_segment_distance_m(40.5, -73.99, 40.0, -74.0, 41.0, -74.0);
+        // Should be roughly the east-west distance at lat 40.5 for 0.01° ≈ 850m
+        assert!(d > 500.0 && d < 1500.0);
+    }
+
+    #[test]
+    fn point_to_route_distance_multi_segment() {
+        let segments = vec![
+            vec![[40.0, -74.0], [40.01, -74.0]],
+            vec![[40.02, -74.0], [40.03, -74.0]],
+        ];
+        // Point between the two segments
+        let d = point_to_route_distance_m(40.015, -74.0, &segments);
+        // Should be about 500m (midpoint between seg1 end and seg2 start)
+        assert!(d > 200.0 && d < 800.0);
+    }
+
+    // --- Tests for expand_nodes_with_adjacent_ways ---
+
+    #[test]
+    fn expand_nodes_respects_spatial_bounds() {
+        // Main highway way near origin
+        let main_way = route_way(
+            1,
+            &["I-10"],
+            &[100, 101, 102],
+            &[(30.0, -90.0), (30.001, -90.0), (30.002, -90.0)],
+            "motorway",
+            true,
+        );
+        // Nearby ramp link (should be included)
+        let nearby_link = route_way(
+            2,
+            &[],
+            &[102, 200, 201],
+            &[(30.002, -90.0), (30.003, -90.001), (30.004, -90.001)],
+            "motorway_link",
+            true,
+        );
+        // Distant ramp link connected through a chain (should be excluded by spatial bound)
+        let distant_link = route_way(
+            3,
+            &[],
+            &[201, 300, 301],
+            &[(30.004, -90.001), (31.0, -90.0), (31.5, -90.0)],
+            "motorway_link",
+            true,
+        );
+
+        let ways_by_id = HashMap::from([
+            (1, main_way),
+            (2, nearby_link),
+            (3, distant_link),
+        ]);
+        let assigned = HashSet::from([100, 101, 102]);
+
+        let expanded = expand_nodes_with_adjacent_ways(&assigned, "I-10", &ways_by_id);
+
+        // Nearby ramp nodes should be included
+        assert!(expanded.contains(&200));
+        // Distant node at lat 31.0/31.5 should be excluded (>2km bounding box)
+        assert!(!expanded.contains(&300));
+        assert!(!expanded.contains(&301));
+    }
+
+    // --- Tests for resolve_semicolon_refs ---
+
+    #[test]
+    fn resolve_semicolon_refs_splits_combined_ref() {
+        let exits = vec![ExitRow {
+            exit_id: "node/1".into(),
+            highway: "I-10".into(),
+            graph_node: 1,
+            ref_val: Some("143A;143B".into()),
+            name: None,
+            lat: 30.0,
+            lon: -90.0,
+        }];
+
+        let result = resolve_semicolon_refs(exits);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"143A"));
+        assert!(refs.contains(&"143B"));
+    }
+
+    // --- Tests for expand_compound_refs ---
+
+    #[test]
+    fn expand_compound_refs_expands_letter_range() {
+        let exits = vec![ExitRow {
+            exit_id: "node/2".into(),
+            highway: "I-95".into(),
+            graph_node: 2,
+            ref_val: Some("17A-B".into()),
+            name: None,
+            lat: 40.0,
+            lon: -74.0,
+        }];
+
+        let result = expand_compound_refs(exits);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"17A"));
+        assert!(refs.contains(&"17B"));
+    }
+
+    // --- Tests for expand_comma_refs ---
+
+    #[test]
+    fn expand_comma_refs_splits_comma_pair() {
+        let exits = vec![ExitRow {
+            exit_id: "node/3".into(),
+            highway: "I-40".into(),
+            graph_node: 3,
+            ref_val: Some("11A,B".into()),
+            name: None,
+            lat: 35.0,
+            lon: -85.0,
+        }];
+
+        let result = expand_comma_refs(exits);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"11A"));
+        assert!(refs.contains(&"11B"));
+    }
+
+    // --- Tests for synthesize_merged_letter_refs ---
+
+    #[test]
+    fn synthesize_merged_letter_refs_creates_combined_form() {
+        let exits = vec![
+            ExitRow {
+                exit_id: "node/10".into(),
+                highway: "I-75".into(),
+                graph_node: 10,
+                ref_val: Some("214A".into()),
+                name: None,
+                lat: 33.0,
+                lon: -84.0,
+            },
+            ExitRow {
+                exit_id: "node/11".into(),
+                highway: "I-75".into(),
+                graph_node: 11,
+                ref_val: Some("214B".into()),
+                name: None,
+                lat: 33.001,
+                lon: -84.0,
+            },
+        ];
+
+        let result = synthesize_merged_letter_refs(exits);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"214A"));
+        assert!(refs.contains(&"214B"));
+        assert!(refs.contains(&"214AB"));
+    }
+
+    // --- Tests for discover_sibling_exits ---
+
+    #[test]
+    fn discover_sibling_exits_finds_lettered_variant() {
+        let exits = vec![ExitRow {
+            exit_id: "node/50".into(),
+            highway: "I-95".into(),
+            graph_node: 50,
+            ref_val: Some("100B".into()),
+            name: None,
+            lat: 40.0,
+            lon: -74.0,
+        }];
+
+        let mut all_nodes = HashMap::new();
+        // Sibling 100A nearby (500m away)
+        all_nodes.insert(
+            51,
+            ExitNodeInfo {
+                ref_val: Some("100A".into()),
+                name: None,
+                lat: 40.004,
+                lon: -74.0,
+            },
+        );
+        // Distant 100C (should be excluded at 2km)
+        all_nodes.insert(
+            52,
+            ExitNodeInfo {
+                ref_val: Some("100C".into()),
+                name: None,
+                lat: 40.05,
+                lon: -74.0,
+            },
+        );
+
+        let result = discover_sibling_exits(exits, &all_nodes);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        assert!(refs.contains(&"100A"), "nearby sibling should be found");
+        assert!(refs.contains(&"100B"), "original exit should remain");
+        assert!(!refs.contains(&"100C"), "distant sibling should be excluded");
     }
 }
