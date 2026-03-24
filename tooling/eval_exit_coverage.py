@@ -296,7 +296,7 @@ def _match_by_proximity(
              * math.sin(dlon / 2) ** 2)
         return R * 2 * math.asin(math.sqrt(a))
 
-    MAX_DISTANCE_M = 500.0
+    MAX_DISTANCE_M = 1000.0
 
     # Load ground truth exit locations
     conn = sqlite3.connect(GROUND_TRUTH_DB)
