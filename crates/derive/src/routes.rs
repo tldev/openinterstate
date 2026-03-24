@@ -482,6 +482,9 @@ fn resample(points: &[[f64; 2]], step_m: f64) -> Vec<[f64; 2]> {
 }
 
 fn apply_lane_offset(points: &[[f64; 2]], offset_m: f64) -> Vec<[f64; 2]> {
+    if points.len() <= 1 {
+        return points.to_vec();
+    }
     let mut result = Vec::with_capacity(points.len());
 
     for i in 0..points.len() {
@@ -588,4 +591,33 @@ fn build_anchors(routes: &[RouteRow]) -> Vec<AnchorRow> {
     }
 
     anchors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_lane_offset_empty_points() {
+        let result = apply_lane_offset(&[], 10.0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn apply_lane_offset_single_point() {
+        let points = [[40.0, -74.0]];
+        let result = apply_lane_offset(&points, 10.0);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], [40.0, -74.0]);
+    }
+
+    #[test]
+    fn apply_lane_offset_two_points() {
+        let points = [[40.0, -74.0], [40.01, -74.0]];
+        let result = apply_lane_offset(&points, 50.0);
+        assert_eq!(result.len(), 2);
+        // Offset should shift longitude (perpendicular to north-south bearing)
+        assert!((result[0][0] - 40.0).abs() < 0.001);
+        assert!((result[1][0] - 40.01).abs() < 0.001);
+    }
 }
