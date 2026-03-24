@@ -1923,12 +1923,14 @@ fn synthesize_merged_letter_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
             });
         }
 
-        // Strategy 2: also generate the full merged form across all nodes
+        // Strategy 2: also generate the merged form across all nodes, but only
+        // for small groups (≤3 letters). Larger groups like I-110 exits 1A–1J are
+        // independent exits along the corridor, not a split interchange.
         if entries.len() >= 2 {
             let mut sorted: Vec<_> = entries.iter().collect();
             sorted.sort_by_key(|e| e.ch);
             sorted.dedup_by_key(|e| e.ch);
-            if sorted.len() >= 2 {
+            if sorted.len() >= 2 && sorted.len() <= 3 {
                 let merged = format!(
                     "{}{}",
                     base,
@@ -3428,6 +3430,32 @@ mod tests {
         assert!(refs.contains(&"214A"));
         assert!(refs.contains(&"214B"));
         assert!(refs.contains(&"214AB"));
+    }
+
+    #[test]
+    fn synthesize_merged_letter_refs_skips_large_groups() {
+        // Simulate I-110 exits 1A through 1F on different nodes — should NOT
+        // produce "1ABCDEF" since that's not a split interchange.
+        let exits: Vec<ExitRow> = ('A'..='F')
+            .enumerate()
+            .map(|(i, ch)| ExitRow {
+                exit_id: format!("node/{}", 100 + i),
+                highway: "I-110".into(),
+                graph_node: (100 + i) as i64,
+                ref_val: Some(format!("1{}", ch)),
+                name: None,
+                lat: 33.0 + (i as f64) * 0.01,
+                lon: -84.0,
+            })
+            .collect();
+
+        let result = synthesize_merged_letter_refs(exits);
+        let refs: Vec<_> = result.iter().filter_map(|e| e.ref_val.as_deref()).collect();
+        // Individual refs preserved
+        assert!(refs.contains(&"1A"));
+        assert!(refs.contains(&"1F"));
+        // No giant merged form
+        assert!(!refs.iter().any(|r| r.len() > 4), "should not produce merged refs longer than base+3 letters");
     }
 
     // --- Tests for discover_sibling_exits ---
