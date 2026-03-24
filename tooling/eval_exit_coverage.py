@@ -243,7 +243,108 @@ def match_with_normalization(
         if base_hw and _ref_in_oi(base_hw, ref, oi_pairs):
             matched.add((hw, ref))
 
+    # Spatial proximity matching: if an ground truth exit is within 200m of an OI exit
+    # on the same highway, count as matched (handles renumbered exits and
+    # concurrent route overlaps like I-27/I-40).
+    remaining = ground_truth_pairs - matched
+    if remaining:
+        matched |= _match_by_proximity(remaining, oi_pairs)
+
     return matched
+
+
+def _match_by_proximity(
+    unmatched: set[tuple[str, str]],
+    oi_pairs: set[tuple[str, str]],
+) -> set[tuple[str, str]]:
+    """Match unmatched ground truth exits by spatial proximity to OI exits.
+
+    If an ground truth exit is within 200m of any OI exit on the same highway,
+    count it as matched. This handles renumbered exits and concurrent
+    route overlaps (e.g. I-27/I-40).
+    """
+    import math
+
+    def haversine_m(lat1, lon1, lat2, lon2):
+        R = 6371000
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (math.sin(dlat / 2) ** 2
+             + math.cos(math.radians(lat1))
+             * math.cos(math.radians(lat2))
+             * math.sin(dlon / 2) ** 2)
+        return R * 2 * math.asin(math.sqrt(a))
+
+    MAX_DISTANCE_M = 200.0
+
+    # Load ground truth exit locations
+    conn = sqlite3.connect(GROUND_TRUTH_DB)
+    rows = conn.execute(
+        """
+        SELECT DISTINCT h.display_name, e.sign_number,
+               e.exit_latitude, e.exit_longitude
+        FROM exits e
+        JOIN request_exits re ON re.exit_id = e.exit_id
+        JOIN exits_requests er ON er.cache_key = re.cache_key
+        JOIN highway_in_states his ON his.highway_in_state_id = er.highway_in_state_id
+        JOIN highways h ON h.highway_id = his.highway_id
+        WHERE h.highway_type = 'Interstate'
+          AND e.sign_number IS NOT NULL AND e.sign_number != ''
+          AND h.display_name LIKE 'I-%'
+        """
+    ).fetchall()
+    conn.close()
+
+    gt_locs: dict[tuple[str, str], tuple[float, float]] = {}
+    for dn, sn, lat, lon in rows:
+        sn = sn.strip()
+        key = (dn, sn)
+        if key in unmatched and lat and lon:
+            gt_locs[key] = (lat, lon)
+
+    if not gt_locs:
+        return set()
+
+    # Load OI exit locations
+    raw = query_psql(
+        "SELECT c.highway, ce.ref, ce.lat, ce.lon "
+        "FROM corridor_exits ce "
+        "JOIN corridors c ON c.corridor_id = ce.corridor_id "
+        "WHERE c.highway LIKE 'I-%' "
+        "AND ce.ref IS NOT NULL AND ce.ref != ''"
+    )
+    oi_by_hw: dict[str, list[tuple[float, float]]] = {}
+    for line in raw.split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 4:
+            hw = parts[0]
+            try:
+                lat, lon = float(parts[2]), float(parts[3])
+                oi_by_hw.setdefault(hw, []).append((lat, lon))
+            except ValueError:
+                continue
+
+    # Also include base highway for suffix routes
+    for hw, locs in list(oi_by_hw.items()):
+        base = strip_highway_suffix(hw)
+        if base:
+            oi_by_hw.setdefault(base, []).extend(locs)
+
+    proximity_matched: set[tuple[str, str]] = set()
+    for (hw, ref), (gt_lat, gt_lon) in gt_locs.items():
+        if hw not in oi_by_hw:
+            continue
+        for oi_lat, oi_lon in oi_by_hw[hw]:
+            # Quick lat-delta filter (~200m ≈ 0.002°)
+            if abs(gt_lat - oi_lat) > 0.01 or abs(gt_lon - oi_lon) > 0.01:
+                continue
+            if haversine_m(gt_lat, gt_lon, oi_lat, oi_lon) <= MAX_DISTANCE_M:
+                proximity_matched.add((hw, ref))
+                break
+
+    return proximity_matched
 
 
 def strip_highway_suffix(highway: str) -> str | None:
