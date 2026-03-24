@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate OI corridor exit coverage against ground truth ground truth.
+"""Evaluate OI corridor exit coverage against ground truth.
 
 Produces a single score (ground truth exact match %) and checks three hard gates:
   1. Corridor count >= minimum (default 262)
@@ -27,10 +27,18 @@ PSQL = os.environ.get(
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://osm:osm_dev@localhost:5434/osm"
 )
-GROUND_TRUTH_DB = os.environ.get(
-    "GROUND_TRUTH_DB",
-    "/Users/tjohnell/projects/pike/server/.data/ground_truth_portal.sqlite",
-)
+GROUND_TRUTH_DB = os.environ.get("GROUND_TRUTH_DB")
+
+
+def _require_ground_truth_db() -> str:
+    if not GROUND_TRUTH_DB:
+        print(
+            "error: GROUND_TRUTH_DB environment variable is not set. "
+            "Set it to the path of the ground truth SQLite database.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return GROUND_TRUTH_DB
 BASELINE_PATH = os.environ.get(
     "EVAL_BASELINE", "tooling/.eval_baseline.json"
 )
@@ -188,7 +196,7 @@ def _is_non_exit_ref(ref: str) -> bool:
 
 
 def load_ground_truth_pairs() -> set[tuple[str, str]]:
-    conn = sqlite3.connect(GROUND_TRUTH_DB)
+    conn = sqlite3.connect(_require_ground_truth_db())
     rows = conn.execute(
         """
         SELECT DISTINCT h.display_name, e.sign_number
@@ -264,9 +272,9 @@ def match_with_normalization(
         if base_hw and _ref_in_oi(base_hw, ref, oi_pairs):
             matched.add((hw, ref))
 
-    # Spatial proximity matching: if an ground truth exit is within 200m of an OI exit
-    # on the same highway, count as matched (handles renumbered exits and
-    # concurrent route overlaps like I-27/I-40).
+    # Spatial proximity matching: if a ground truth exit is within 500m of an
+    # OI exit on the same highway, count as matched (handles renumbered exits
+    # and concurrent route overlaps like I-27/I-40).
     remaining = ground_truth_pairs - matched
     if remaining:
         matched |= _match_by_proximity(remaining, oi_pairs)
@@ -280,9 +288,9 @@ def _match_by_proximity(
 ) -> set[tuple[str, str]]:
     """Match unmatched ground truth exits by spatial proximity to OI exits.
 
-    If the closest OI exit on the same highway is within 500m of an
-    ground truth exit, count it as matched. This handles renumbered exits and
-    concurrent route overlaps (e.g. I-27/I-40).
+    If the closest OI exit on the same highway is within 500m of a
+    ground truth exit, count it as matched. This handles renumbered exits
+    and concurrent route overlaps (e.g. I-27/I-40).
     """
     import math
 
@@ -299,7 +307,7 @@ def _match_by_proximity(
     MAX_DISTANCE_M = 500.0
 
     # Load ground truth exit locations
-    conn = sqlite3.connect(GROUND_TRUTH_DB)
+    conn = sqlite3.connect(_require_ground_truth_db())
     rows = conn.execute(
         """
         SELECT DISTINCT h.display_name, e.sign_number,

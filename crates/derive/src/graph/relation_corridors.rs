@@ -1704,56 +1704,6 @@ fn discover_nearby_exits(
     result
 }
 
-/// Split semicolon-separated exit refs (e.g. "143A;143B") into individual
-/// entries, preferring dedicated ramp nodes when they exist.
-fn resolve_semicolon_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
-    let mut individual_refs: HashSet<String> = HashSet::new();
-    for exit in &exits {
-        if let Some(ref r) = exit.ref_val {
-            if !r.contains(';') {
-                individual_refs.insert(r.clone());
-            }
-        }
-    }
-
-    let mut result = Vec::with_capacity(exits.len());
-    for exit in exits {
-        let Some(ref ref_val) = exit.ref_val else {
-            result.push(exit);
-            continue;
-        };
-        if !ref_val.contains(';') {
-            result.push(exit);
-            continue;
-        }
-
-        // Keep the original combined form so it still matches ground truth
-        // databases that store "106A;106B" as a literal sign number.
-        result.push(exit.clone());
-
-        let parts: Vec<&str> = ref_val
-            .split(';')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-        for part in parts {
-            if individual_refs.contains(part) {
-                continue;
-            }
-            result.push(ExitRow {
-                exit_id: format!("{}:{}", exit.exit_id, part),
-                highway: exit.highway.clone(),
-                graph_node: exit.graph_node,
-                ref_val: Some(part.to_string()),
-                name: exit.name.clone(),
-                lat: exit.lat,
-                lon: exit.lon,
-            });
-        }
-    }
-    result
-}
-
 /// Expand compound letter-range exits like "17A-B" into individual entries
 /// ("17A", "17B") while keeping the original compound form.
 fn expand_compound_refs(exits: Vec<ExitRow>) -> Vec<ExitRow> {
@@ -3298,6 +3248,7 @@ mod tests {
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].ref_val.as_deref(), Some("5A"));
         assert_eq!(resolved[1].ref_val.as_deref(), Some("5B"));
+    }
 
     // --- Tests for new geometry functions ---
 
