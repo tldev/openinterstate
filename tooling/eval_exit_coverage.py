@@ -280,9 +280,9 @@ def _match_by_proximity(
 ) -> set[tuple[str, str]]:
     """Match unmatched ground truth exits by spatial proximity to OI exits.
 
-    If an ground truth exit is within 200m of any OI exit on the same highway,
-    count it as matched. This handles renumbered exits and concurrent
-    route overlaps (e.g. I-27/I-40).
+    If the closest OI exit on the same highway is within 500m of an
+    ground truth exit, count it as matched. This handles renumbered exits and
+    concurrent route overlaps (e.g. I-27/I-40).
     """
     import math
 
@@ -296,7 +296,7 @@ def _match_by_proximity(
              * math.sin(dlon / 2) ** 2)
         return R * 2 * math.asin(math.sqrt(a))
 
-    MAX_DISTANCE_M = 1000.0
+    MAX_DISTANCE_M = 500.0
 
     # Load ground truth exit locations
     conn = sqlite3.connect(GROUND_TRUTH_DB)
@@ -316,12 +316,12 @@ def _match_by_proximity(
     ).fetchall()
     conn.close()
 
-    gt_locs: dict[tuple[str, str], tuple[float, float]] = {}
+    gt_locs: dict[tuple[str, str], list[tuple[float, float]]] = {}
     for dn, sn, lat, lon in rows:
         sn = sn.strip()
         key = (dn, sn)
         if key in unmatched and lat and lon:
-            gt_locs[key] = (lat, lon)
+            gt_locs.setdefault(key, []).append((lat, lon))
 
     if not gt_locs:
         return set()
@@ -354,30 +354,46 @@ def _match_by_proximity(
             oi_by_hw.setdefault(base, []).extend(locs)
 
     proximity_matched: set[tuple[str, str]] = set()
-    for (hw, ref), (gt_lat, gt_lon) in gt_locs.items():
+    for (hw, ref), gt_locations in gt_locs.items():
         if hw not in oi_by_hw:
             continue
-        for oi_lat, oi_lon in oi_by_hw[hw]:
-            # Quick lat-delta filter (~200m ≈ 0.002°)
-            if abs(gt_lat - oi_lat) > 0.01 or abs(gt_lon - oi_lon) > 0.01:
-                continue
-            if haversine_m(gt_lat, gt_lon, oi_lat, oi_lon) <= MAX_DISTANCE_M:
-                proximity_matched.add((hw, ref))
-                break
+        best_dist = float("inf")
+        for gt_lat, gt_lon in gt_locations:
+            for oi_lat, oi_lon in oi_by_hw[hw]:
+                # Quick lat-delta filter (~500m ≈ 0.005°, use 0.01° for margin)
+                if abs(gt_lat - oi_lat) > 0.01 or abs(gt_lon - oi_lon) > 0.01:
+                    continue
+                dist = haversine_m(gt_lat, gt_lon, oi_lat, oi_lon)
+                if dist < best_dist:
+                    best_dist = dist
+        if best_dist <= MAX_DISTANCE_M:
+            proximity_matched.add((hw, ref))
 
     return proximity_matched
 
 
 def strip_highway_suffix(highway: str) -> str | None:
-    """Strip directional suffix from highways like I-35E → I-35.
+    """Strip directional suffix from known concurrent-split interstates.
 
-    Only strips single trailing letters (E/W/N/S/C) after the route
-    number, which represent concurrent route splits in the US Interstate
-    system (e.g. I-35E, I-35W, I-69C).
+    Only strips suffixes for routes that are known concurrent splits
+    (e.g. I-35E/I-35W, I-69C/I-69E/I-69W), NOT for spur interstates
+    like I-95A which are distinct routes.
     """
-    import re
-    m = re.match(r'^(I-\d+)[A-Z]$', highway)
-    return m.group(1) if m else None
+    # Known concurrent splits and directional variants in the US Interstate
+    # system.  Do NOT add spur interstates like I-95A here — those are
+    # distinct routes.
+    _CONCURRENT_SPLITS = {
+        "I-35E": "I-35",
+        "I-35W": "I-35",
+        "I-69C": "I-69",
+        "I-69E": "I-69",
+        "I-69W": "I-69",
+        "I-80E": "I-80",
+        "I-80W": "I-80",
+        "I-80U": "I-80",
+        "I-480N": "I-480",
+    }
+    return _CONCURRENT_SPLITS.get(highway)
 
 
 def load_oi_pairs() -> set[tuple[str, str]]:
