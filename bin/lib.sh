@@ -594,15 +594,15 @@ oi_download_pbf() {
 oi_canonical_filter_args() {
   cat <<'EOF'
 n/highway=motorway_junction
-n/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station
-n/tourism=hotel,motel,guest_house
+n/amenity=fuel,restaurant,fast_food,cafe,charging_station
+n/tourism=hotel,motel
 n/shop=gas
 n/cuisine
 n/highway=rest_area,services
 w/highway=construction
 w/highway=motorway,motorway_link,trunk,trunk_link,rest_area,services
-w/amenity=fuel,restaurant,fast_food,cafe,toilets,charging_station
-w/tourism=hotel,motel,guest_house
+w/amenity=fuel,restaurant,fast_food,cafe,charging_station
+w/tourism=hotel,motel
 w/shop=gas
 w/cuisine
 EOF
