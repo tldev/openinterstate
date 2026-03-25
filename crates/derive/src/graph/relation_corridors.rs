@@ -151,10 +151,29 @@ pub async fn build_corridors(
     let connector_graph = build_connector_graph(ways_by_id.values().collect::<Vec<_>>().as_slice());
     let highway_edges = load_highway_edges(pool).await?;
     let exits = load_exit_rows(pool).await?;
-    let all_exit_nodes = load_all_exit_nodes(pool).await?;
+    let mut all_exit_nodes = load_all_exit_nodes(pool).await?;
+    let rest_area_names = load_rest_area_names_by_exit(pool).await?;
+
+    // Enrich all_exit_nodes with rest area POI names so that exits discovered
+    // via sibling/nearby lookup also inherit rest area names.
+    for (exit_id, ra_name) in &rest_area_names {
+        if let Some(node_id_str) = exit_id.strip_prefix("node/") {
+            if let Ok(node_id) = node_id_str.parse::<i64>() {
+                if let Some(info) = all_exit_nodes.get_mut(&node_id) {
+                    if info.ref_val.as_ref().map_or(true, |r| r.is_empty())
+                        && info.name.as_ref().map_or(true, |n| n.is_empty())
+                    {
+                        info.name = Some(ra_name.clone());
+                    }
+                }
+            }
+        }
+    }
+
     tracing::info!(
-        "Loaded {} exit nodes from osm2pgsql_v2_exits_nodes",
-        all_exit_nodes.len()
+        "Loaded {} exit nodes from osm2pgsql_v2_exits_nodes, {} exits with rest area POIs",
+        all_exit_nodes.len(),
+        rest_area_names.len(),
     );
 
     let mut exits_by_highway: HashMap<String, Vec<ExitRow>> = HashMap::new();
@@ -189,6 +208,7 @@ pub async fn build_corridors(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
             &all_exit_nodes,
+            &rest_area_names,
             next_corridor_id,
         )?
         else {
@@ -208,6 +228,7 @@ pub async fn build_corridors(
         &covered_highways,
         &mut next_corridor_id,
         &all_exit_nodes,
+        &rest_area_names,
     )
     .await?;
     if !fallback_drafts.is_empty() {
@@ -436,6 +457,25 @@ struct ExitNodeInfo {
     lon: f64,
 }
 
+/// Load the best rest area POI name for each exit that has restArea POIs.
+/// Used to inherit names onto bare motorway_junction nodes that serve rest areas.
+async fn load_rest_area_names_by_exit(
+    pool: &PgPool,
+) -> Result<HashMap<String, String>, anyhow::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT ON (epc.exit_id) epc.exit_id, \
+                COALESCE(NULLIF(p.display_name, ''), NULLIF(p.name, ''), 'Rest Area') \
+         FROM exit_poi_candidates epc \
+         JOIN pois p ON p.id = epc.poi_id \
+         WHERE epc.category = 'restArea' \
+         ORDER BY epc.exit_id, epc.distance_m",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().collect())
+}
+
 fn build_corridor_draft(
     group: &InterstateRouteGroup,
     ways_by_id: &HashMap<i64, RouteWay>,
@@ -443,6 +483,7 @@ fn build_corridor_draft(
     edge_rows: &[HighwayEdgeRow],
     exit_rows: &[ExitRow],
     all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
+    rest_area_names: &HashMap<String, String>,
     corridor_id: i32,
 ) -> Result<Option<CorridorDraft>, anyhow::Error> {
     let canonical_direction = group
@@ -581,6 +622,24 @@ fn build_corridor_draft(
     let corridor_exit_rows = expand_compound_refs(corridor_exit_rows);
     let corridor_exit_rows = expand_comma_refs(corridor_exit_rows);
     let corridor_exit_rows = synthesize_merged_letter_refs(corridor_exit_rows);
+
+    // Inherit rest area POI names onto bare motorway_junction nodes.
+    // In OSM, rest area junction nodes often have no ref or name — the name
+    // lives on the highway=rest_area way. Without this, these exits are
+    // dropped by the noref/noname filter below.
+    let corridor_exit_rows: Vec<ExitRow> = corridor_exit_rows
+        .into_iter()
+        .map(|mut exit| {
+            if exit.ref_val.as_ref().map_or(true, |r| r.is_empty())
+                && exit.name.as_ref().map_or(true, |n| n.is_empty())
+            {
+                if let Some(ra_name) = rest_area_names.get(&exit.exit_id) {
+                    exit.name = Some(ra_name.clone());
+                }
+            }
+            exit
+        })
+        .collect();
 
     // Only keep exits that have at least a ref (exit number) or a name.
     // Bare motorway_junction nodes with neither are not useful to downstream
@@ -2066,6 +2125,7 @@ async fn build_graph_fallback_corridors(
     covered_highways: &HashSet<String>,
     next_corridor_id: &mut i32,
     all_exit_nodes: &HashMap<i64, ExitNodeInfo>,
+    rest_area_names: &HashMap<String, String>,
 ) -> Result<Vec<CorridorDraft>, anyhow::Error> {
     // Find highways with exit_corridors that don't have relation-backed drafts.
     // We check against covered_highways (the in-memory draft list) rather than
@@ -2168,11 +2228,25 @@ async fn build_graph_fallback_corridors(
             let mut exits: Vec<CorridorExitDraft> = Vec::new();
             for (exit_id, graph_node, ref_val, name, lat, lon) in &exit_rows {
                 if ec_node_ids.contains(graph_node) {
+                    // Inherit rest area POI name for bare motorway_junction nodes
+                    let effective_name = if ref_val.as_ref().map_or(true, |r| r.is_empty())
+                        && name.as_ref().map_or(true, |n| n.is_empty())
+                    {
+                        rest_area_names.get(exit_id).cloned()
+                    } else {
+                        name.clone()
+                    };
+                    // Skip exits with no ref and no name (even after rest area lookup)
+                    if ref_val.as_ref().map_or(true, |r| r.is_empty())
+                        && effective_name.as_ref().map_or(true, |n| n.is_empty())
+                    {
+                        continue;
+                    }
                     let sort_key = projection_for_direction([*lat, *lon], direction);
                     exits.push(CorridorExitDraft {
                         exit_id: exit_id.clone(),
                         ref_val: ref_val.clone(),
-                        name: name.clone(),
+                        name: effective_name,
                         lat: *lat,
                         lon: *lon,
                         sort_key_m: sort_key,
