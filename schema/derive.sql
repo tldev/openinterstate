@@ -303,15 +303,25 @@ SELECT
     NULL::text AS state,
     src.category,
     CASE
-        WHEN COALESCE(NULLIF(src.name, ''), '') = '' AND src.category = 'restArea'
+        WHEN src.category = 'restArea' AND (
+            COALESCE(NULLIF(src.name, ''), '') = ''
+            OR (COALESCE(src.tags_json->>'name', '') = ''
+                AND COALESCE(src.tags_json->>'brand', '') = '')
+        )
         THEN 'Rest Area'
         ELSE src.name
     END AS name,
-    COALESCE(
-        NULLIF(src.display_name, ''),
-        NULLIF(src.name, ''),
-        CASE WHEN src.category = 'restArea' THEN 'Rest Area' END
-    ) AS display_name,
+    CASE
+        WHEN src.category = 'restArea' AND (
+            COALESCE(src.tags_json->>'name', '') = ''
+            AND COALESCE(src.tags_json->>'brand', '') = '')
+        THEN 'Rest Area'
+        ELSE COALESCE(
+            NULLIF(src.display_name, ''),
+            NULLIF(src.name, ''),
+            CASE WHEN src.category = 'restArea' THEN 'Rest Area' END
+        )
+    END AS display_name,
     src.brand,
     src.geom,
     src.tags_json
