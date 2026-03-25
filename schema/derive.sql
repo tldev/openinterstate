@@ -302,8 +302,16 @@ SELECT
     src.osm_id,
     NULL::text AS state,
     src.category,
-    src.name,
-    COALESCE(NULLIF(src.display_name, ''), src.name) AS display_name,
+    CASE
+        WHEN COALESCE(NULLIF(src.name, ''), '') = '' AND src.category = 'restArea'
+        THEN 'Rest Area'
+        ELSE src.name
+    END AS name,
+    COALESCE(
+        NULLIF(src.display_name, ''),
+        NULLIF(src.name, ''),
+        CASE WHEN src.category = 'restArea' THEN 'Rest Area' END
+    ) AS display_name,
     src.brand,
     src.geom,
     src.tags_json
@@ -351,7 +359,7 @@ FROM (
      AND ST_DWithin(e.geom::geography, p.geom::geography, 800.0)
     WHERE p.category IS NOT NULL
       AND p.category <> 'restroom'
-      AND LOWER(TRIM(COALESCE(NULLIF(p.display_name, ''), NULLIF(p.name, ''), 'Unknown'))) <> 'unknown'
+      AND (p.category = 'restArea' OR LOWER(TRIM(COALESCE(NULLIF(p.display_name, ''), NULLIF(p.name, ''), 'Unknown'))) <> 'unknown')
       AND NOT EXISTS (
           SELECT 1
           FROM exit_poi_reachability prior
