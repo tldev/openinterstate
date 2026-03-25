@@ -125,10 +125,13 @@ function osm2pgsql.process_node(object)
 
     local cat = classify_poi(tags)
     if cat ~= nil then
-        local display_name = tags.brand or tags.name or tags.operator
+        -- operator fallback excluded: operator tags (e.g. "Florida Department
+        -- of Transportation") are not user-facing names.  Raw tags are stored
+        -- in the tags jsonb column for derive-time access if needed.
+        local display_name = tags.brand or tags.name
         poi_nodes:insert({
             category = cat,
-            name = tags.name or tags.brand or tags.operator,
+            name = tags.name or tags.brand,
             display_name = display_name,
             brand = tags.brand,
             tags = tags,
@@ -172,10 +175,10 @@ function osm2pgsql.process_way(object)
             way_geom = object:as_linestring()
         end
         if way_geom ~= nil then
-            local display_name = tags.brand or tags.name or tags.operator
+            local display_name = tags.brand or tags.name
             poi_ways:insert({
                 category = cat,
-                name = tags.name or tags.brand or tags.operator,
+                name = tags.name or tags.brand,
                 display_name = display_name,
                 brand = tags.brand,
                 tags = tags,
