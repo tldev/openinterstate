@@ -544,20 +544,6 @@ oi_container_path() {
   printf '/data/%s\n' "$rel_path"
 }
 
-oi_guard_no_reachability_clears() {
-  local sql_file="$1"
-  local pattern
-
-  for pattern in \
-    'TRUNCATE[[:space:]]+[^;]*exit_poi_reachability' \
-    'DELETE[[:space:]]+FROM[[:space:]]+exit_poi_reachability' \
-    'DROP[[:space:]]+TABLE[[:space:]]+[^;]*exit_poi_reachability'
-  do
-    if rg -n -i -e "$pattern" "$sql_file" >/dev/null 2>&1; then
-      oi_die "guardrail violation in $(basename "$sql_file"): reachability clears are forbidden"
-    fi
-  done
-}
 
 oi_download_pbf() {
   local source_url="$1"
@@ -1006,10 +992,8 @@ oi_extract_interstate_relation_cache() {
 oi_apply_derive() {
   local derive_file="$REPO_ROOT/schema/derive.sql"
   local derive_state_file import_state_file import_signature derive_signature derive_sql_signature derive_code_signature
-  local reachability_signature relation_cache_file relation_cache_signature
+  local relation_cache_file relation_cache_signature
   local -a derive_source_files=()
-
-  oi_guard_no_reachability_clears "$derive_file"
 
   import_state_file="$(oi_state_file import "$OI_DATA_ROOT|$OI_DB_NAME")"
   import_signature="$(oi_state_read "$import_state_file" signature 2>/dev/null || true)"
@@ -1032,19 +1016,12 @@ oi_apply_derive() {
   relation_cache_file="$(oi_extract_interstate_relation_cache)"
   [[ -f "$relation_cache_file" ]] || oi_die "missing Interstate relation cache: $relation_cache_file"
   relation_cache_signature="$(oi_file_signature "$relation_cache_file")"
-  reachability_signature="$(
-    {
-      oi_db_query "SELECT COUNT(*), COALESCE(MAX(updated_at)::text, '') FROM exit_poi_reachability;" 2>/dev/null || true
-      oi_db_query "SELECT COUNT(*), COALESCE(MAX(updated_at)::text, '') FROM osrm_snap_hints;" 2>/dev/null || true
-    } | oi_hash_stdin
-  )"
   derive_signature="$(
     {
       printf 'import=%s\n' "$import_signature"
       printf 'derive_sql=%s\n' "$derive_sql_signature"
       printf 'derive_code=%s\n' "$derive_code_signature"
       printf 'relation_cache=%s\n' "$relation_cache_signature"
-      printf 'reachability=%s\n' "$reachability_signature"
     } | oi_hash_stdin
   )"
 

@@ -26,7 +26,8 @@
 ## Pike SQLite Follow-On
 
 - After exporting an OpenInterstate release locally, also build Pike's SQLite pack from that exact release archive unless the user explicitly says not to.
-- Use Pike's supported release-driven pipeline entrypoint from `/Users/tjohnell/projects/pike/server`: `./pike-pipeline.sh build --release-file /abs/path/openinterstate-release-<release-id>.tar.gz --reachability-snapshot /Volumes/goose-drive/pike-osrm/reachability/pike.osrm-reachability.snapshot.pgdump`.
+- Use Pike's supported release-driven pipeline entrypoint from `/Users/tjohnell/projects/pike/server`: `./pike-pipeline.sh build --release-file /abs/path/openinterstate-release-<release-id>.tar.gz --reachability-snapshot <path-to-reachability-snapshot>`.
+- Reachability snapshots are produced by the separate `tldev/openinterstate-reachability` repo.
 - Let Pike keep its own default output locations unless the user asks otherwise. The current default host pack output is `/Users/tjohnell/projects/pike/server/.data/packs/pike.sqlite` and the staged build file is `/Users/tjohnell/projects/pike/server/.data/packs/pike.sqlite.new`.
 - After the Pike build finishes, validate the pack with `sqlite3` by checking `PRAGMA integrity_check;` and confirming the `meta` table reports the matching `openinterstate_release_id`.
 

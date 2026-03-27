@@ -24,14 +24,6 @@ A raw or source exit record that maps to a corridor exit.
 
 A point or area of interest reachable from an exit.
 
-### Exit-Place Link
-
-A candidate or selected relationship between an exit and a place.
-
-### Exit-Place Score
-
-Reachability or ranking metadata attached to an exit-place link.
-
 ### Reference Route
 
 A route artifact intended for exploration, QA, examples, and simulation.
@@ -55,19 +47,11 @@ Useful internally, but too implementation-specific for most public docs and APIs
 Preferred replacement: `corridor exit`, `normalized exit`, or a more specific
 term tied to the actual object.
 
-### Candidate
-
-Useful internally, but vague in public docs unless paired with a clearer object.
-
-Preferred replacement: `exit-place link` or `draft link`, depending on context.
-
 ## Retired Internal Names
 
 - `highway_edges` -> `corridor_edges`
 - `canonical_exits` -> `corridor_exits`
 - `canonical_exit_aliases` -> `exit_aliases`
 - `pois` -> `places`
-- `exit_poi_candidates` -> `exit_place_links`
-- `exit_poi_reachability` -> `exit_place_scores`
 - `reference_routes` is the preferred public term for route artifacts
 - `reference_route_anchors` is the preferred public term for route anchor points

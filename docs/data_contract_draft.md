@@ -90,35 +90,6 @@ Draft key fields:
 - `brand`
 - `geometry_geojson`
 
-### exit_place_links
-
-Represents link relationships between exits and places.
-
-Draft key fields:
-
-- `exit_id`
-- `place_id`
-- `category`
-- `distance_m`
-- `rank`
-
-### exit_place_scores
-
-Represents reachability and ranking metadata for a link.
-
-Draft key fields:
-
-- `exit_id`
-- `place_id`
-- `route_distance_m`
-- `route_duration_s`
-- `reachable`
-- `reachability_score`
-- `reachability_confidence`
-- `provider`
-- `provider_dataset_version`
-- `updated_at`
-
 ### reference_routes
 
 Represents route artifacts used for exploration and QA.
