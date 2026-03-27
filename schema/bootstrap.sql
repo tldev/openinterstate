@@ -181,19 +181,3 @@ CREATE TABLE IF NOT EXISTS exit_poi_reachability (
 CREATE INDEX IF NOT EXISTS exit_poi_reachability_exit_idx
     ON exit_poi_reachability (exit_id);
 
-CREATE TABLE IF NOT EXISTS osrm_snap_hints (
-    source_scope TEXT NOT NULL,
-    endpoint_kind TEXT NOT NULL,
-    endpoint_id TEXT NOT NULL,
-    dataset_key TEXT NOT NULL,
-    input_lon DOUBLE PRECISION NOT NULL,
-    input_lat DOUBLE PRECISION NOT NULL,
-    snapped_lon DOUBLE PRECISION NOT NULL,
-    snapped_lat DOUBLE PRECISION NOT NULL,
-    hint TEXT NOT NULL,
-    snapped_distance_m DOUBLE PRECISION,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (source_scope, endpoint_kind, endpoint_id, dataset_key)
-);
-CREATE INDEX IF NOT EXISTS osrm_snap_hints_lookup_idx
-    ON osrm_snap_hints (source_scope, endpoint_kind, dataset_key);

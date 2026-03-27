@@ -34,7 +34,6 @@ release-YYYY-MM-DD/
     exit_aliases.csv
     places.csv
     exit_place_links.csv
-    exit_place_scores.csv
     reference_routes.csv
   gpx/
     reference_routes.gpx.zip

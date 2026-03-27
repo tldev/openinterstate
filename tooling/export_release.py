@@ -473,28 +473,6 @@ def build_export_specs(interstate_filter: str = INTERSTATE_FILTER) -> list[Expor
             """,
         ),
         ExportSpec(
-            name="exit_place_scores",
-            filename="exit_place_scores.csv",
-            query=f"""
-                SELECT
-                  epr.exit_id,
-                  epr.poi_id AS place_id,
-                  epr.route_distance_m,
-                  epr.route_duration_s,
-                  epr.reachable,
-                  epr.reachability_score,
-                  epr.reachability_confidence,
-                  epr.provider,
-                  epr.provider_dataset_version,
-                  epr.updated_at
-                FROM exit_poi_reachability epr
-                JOIN corridor_exits ce ON ce.exit_id = epr.exit_id
-                JOIN corridors c USING (corridor_id)
-                WHERE c.highway ~ '{interstate_filter}'
-                ORDER BY epr.exit_id, epr.poi_id
-            """,
-        ),
-        ExportSpec(
             name="reference_routes",
             filename="reference_routes.csv",
             query=f"""

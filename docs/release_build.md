@@ -117,8 +117,7 @@ changed.
 4. `csv/exit_aliases.csv`
 5. `csv/places.csv`
 6. `csv/exit_place_links.csv`
-7. `csv/exit_place_scores.csv`
-8. `csv/reference_routes.csv`
+7. `csv/reference_routes.csv`
 9. `gpx/reference_routes.gpx.zip`
 10. `examples/sample_corridors.geojson`
 11. `manifest.json`

@@ -28,10 +28,6 @@ A point or area of interest reachable from an exit.
 
 A candidate or selected relationship between an exit and a place.
 
-### Exit-Place Score
-
-Reachability or ranking metadata attached to an exit-place link.
-
 ### Reference Route
 
 A route artifact intended for exploration, QA, examples, and simulation.
@@ -68,6 +64,5 @@ Preferred replacement: `exit-place link` or `draft link`, depending on context.
 - `canonical_exit_aliases` -> `exit_aliases`
 - `pois` -> `places`
 - `exit_poi_candidates` -> `exit_place_links`
-- `exit_poi_reachability` -> `exit_place_scores`
 - `reference_routes` is the preferred public term for route artifacts
 - `reference_route_anchors` is the preferred public term for route anchor points
