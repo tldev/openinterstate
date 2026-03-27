@@ -90,6 +90,18 @@ Draft key fields:
 - `brand`
 - `geometry_geojson`
 
+### exit_place_links
+
+Represents link relationships between exits and places.
+
+Draft key fields:
+
+- `exit_id`
+- `place_id`
+- `category`
+- `distance_m`
+- `rank`
+
 ### reference_routes
 
 Represents route artifacts used for exploration and QA.
