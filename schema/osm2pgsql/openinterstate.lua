@@ -49,7 +49,6 @@ local function classify_poi(tags)
     local tourism = tags.tourism or ""
     local highway = tags.highway or ""
     local shop = tags.shop or ""
-    local leisure = tags.leisure or ""
 
     if amenity == "fuel" or shop == "gas" then
         return "gas"
@@ -68,12 +67,6 @@ local function classify_poi(tags)
     end
     if amenity == "charging_station" then
         return "evCharging"
-    end
-    if leisure == "dog_park" then
-        return "dogPark"
-    end
-    if leisure == "park" then
-        return "park"
     end
     return nil
 end
