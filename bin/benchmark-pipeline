@@ -102,6 +102,10 @@ log "Ensuring runner image"
 docker build -q -t openinterstate-bench-runner \
   -f "$REPO_ROOT/docker/runner/Dockerfile" "$REPO_ROOT" >/dev/null
 
+# Pre-build the Rust derive binary so compilation doesn't pollute stage timing
+log "Pre-building openinterstate-derive (release)"
+runner cargo build --locked --release -p openinterstate-derive >/dev/null 2>&1
+
 # Download PBF (cached)
 SOURCE_PBF="$BENCH_WORK_DIR/source/$(basename "$PBF_URL")"
 if [[ ! -f "$SOURCE_PBF" ]]; then
@@ -234,7 +238,7 @@ for (( run=1; run<=RUNS; run++ )); do
   # --- stage: rust derive (graph + corridors + routes) ----------------------
   time_stage "rust_derive" \
     runner bash -c "
-      cargo run --locked --release -p openinterstate-derive -- \
+      ./target/release/openinterstate-derive \
         --database-url 'postgres://$DB_USER:$DB_PASSWORD@host.docker.internal:$DB_PORT/$DB_NAME' \
         --interstate-relation-cache /bench/cache/interstate-relations.tsv \
         all

@@ -220,6 +220,12 @@ TRUNCATE
     reference_route_anchors,
     reference_routes;
 
+-- Drop GiST indexes before bulk loading exits/pois so inserts don't pay
+-- per-row index maintenance.  Recreated before the spatial join below.
+DROP INDEX IF EXISTS exits_geom_idx;
+DROP INDEX IF EXISTS pois_geom_idx;
+DROP INDEX IF EXISTS exit_poi_candidates_exit_idx;
+
 WITH rest_anchor_exits AS (
     SELECT DISTINCT en.node_id
     FROM osm2pgsql_v2_exits_nodes en
@@ -335,6 +341,11 @@ FROM (
 ) src;
 
 
+-- Rebuild GiST indexes after bulk load (single-pass build is faster than
+-- incremental maintenance during inserts).
+CREATE INDEX exits_geom_idx ON exits USING GIST (geom);
+CREATE INDEX pois_geom_idx ON pois USING GIST (geom);
+
 -- Refresh planner statistics after bulk-loading exits and pois so the
 -- spatial join below uses accurate row estimates and index selectivity.
 ANALYZE exits;
@@ -432,6 +443,10 @@ DELETE FROM exit_poi_candidates c
 USING mismatched m
 WHERE c.exit_id = m.exit_id
   AND c.poi_id = m.poi_id;
+
+-- Rebuild exit_poi_candidates index after bulk load + directional pruning.
+CREATE INDEX exit_poi_candidates_exit_idx
+    ON exit_poi_candidates (exit_id, category, rank);
 
 -- highway_edges, exit_corridors, corridors, and corridor_exits are rebuilt
 -- by openinterstate-derive steps that run after this SQL in the pipeline:
