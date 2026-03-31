@@ -10,3 +10,5 @@ __pycache__/
 *.pyc
 target/
 .data/
+.bench/
+benchmark-results.jsonl

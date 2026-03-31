@@ -109,52 +109,121 @@ pub async fn build_reference_routes(
         .execute(&mut *tx)
         .await?;
 
-    for route in &routes {
+    // Batch insert routes using UNNEST
+    const ROUTE_BATCH: usize = 500;
+    for chunk in routes.chunks(ROUTE_BATCH) {
+        let mut r_ids = Vec::with_capacity(chunk.len());
+        let mut r_highways = Vec::with_capacity(chunk.len());
+        let mut r_dir_codes = Vec::with_capacity(chunk.len());
+        let mut r_dir_labels = Vec::with_capacity(chunk.len());
+        let mut r_display_names = Vec::with_capacity(chunk.len());
+        let mut r_corridor_ids = Vec::with_capacity(chunk.len());
+        let mut r_variant_ranks = Vec::with_capacity(chunk.len());
+        let mut r_distances = Vec::with_capacity(chunk.len());
+        let mut r_durations = Vec::with_capacity(chunk.len());
+        let mut r_intervals = Vec::with_capacity(chunk.len());
+        let mut r_point_counts = Vec::with_capacity(chunk.len());
+        let mut r_start_lats = Vec::with_capacity(chunk.len());
+        let mut r_start_lons = Vec::with_capacity(chunk.len());
+        let mut r_end_lats = Vec::with_capacity(chunk.len());
+        let mut r_end_lons = Vec::with_capacity(chunk.len());
+        let mut r_min_lats = Vec::with_capacity(chunk.len());
+        let mut r_max_lats = Vec::with_capacity(chunk.len());
+        let mut r_min_lons = Vec::with_capacity(chunk.len());
+        let mut r_max_lons = Vec::with_capacity(chunk.len());
+        let mut r_waypoints = Vec::with_capacity(chunk.len());
+
+        for route in chunk {
+            r_ids.push(route.id.as_str());
+            r_highways.push(route.highway.as_str());
+            r_dir_codes.push(route.direction_code.as_str());
+            r_dir_labels.push(route.direction_label.as_str());
+            r_display_names.push(route.display_name.as_str());
+            r_corridor_ids.push(route.corridor_id);
+            r_variant_ranks.push(route.variant_rank);
+            r_distances.push(route.distance_m);
+            r_durations.push(route.duration_s);
+            r_intervals.push(route.interval_s);
+            r_point_counts.push(route.point_count);
+            r_start_lats.push(route.start_lat);
+            r_start_lons.push(route.start_lon);
+            r_end_lats.push(route.end_lat);
+            r_end_lons.push(route.end_lon);
+            r_min_lats.push(route.min_lat);
+            r_max_lats.push(route.max_lat);
+            r_min_lons.push(route.min_lon);
+            r_max_lons.push(route.max_lon);
+            r_waypoints.push(route.waypoints_json.as_str());
+        }
+
         sqlx::query(
             "INSERT INTO reference_routes \
                 (id, highway, direction_code, direction_label, display_name, corridor_id, variant_rank, \
                  distance_m, duration_s, interval_s, point_count, \
                  start_lat, start_lon, end_lat, end_lon, \
                  min_lat, max_lat, min_lon, max_lon, waypoints_json) \
-             VALUES \
-                ($1::uuid, $2, $3, $4, $5, $6, $7, \
-                 $8, $9, $10, $11, \
-                 $12, $13, $14, $15, \
-                 $16, $17, $18, $19, $20)",
+             SELECT id::uuid, highway, direction_code, direction_label, display_name, \
+                corridor_id, variant_rank, distance_m, duration_s, interval_s, point_count, \
+                start_lat, start_lon, end_lat, end_lon, \
+                min_lat, max_lat, min_lon, max_lon, waypoints_json \
+             FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], \
+                $6::int[], $7::int[], $8::float8[], $9::float8[], $10::float8[], $11::int[], \
+                $12::float8[], $13::float8[], $14::float8[], $15::float8[], \
+                $16::float8[], $17::float8[], $18::float8[], $19::float8[], $20::text[]) \
+              AS t(id, highway, direction_code, direction_label, display_name, \
+                corridor_id, variant_rank, distance_m, duration_s, interval_s, point_count, \
+                start_lat, start_lon, end_lat, end_lon, \
+                min_lat, max_lat, min_lon, max_lon, waypoints_json)",
         )
-        .bind(&route.id)
-        .bind(&route.highway)
-        .bind(&route.direction_code)
-        .bind(&route.direction_label)
-        .bind(&route.display_name)
-        .bind(route.corridor_id)
-        .bind(route.variant_rank)
-        .bind(route.distance_m)
-        .bind(route.duration_s)
-        .bind(route.interval_s)
-        .bind(route.point_count)
-        .bind(route.start_lat)
-        .bind(route.start_lon)
-        .bind(route.end_lat)
-        .bind(route.end_lon)
-        .bind(route.min_lat)
-        .bind(route.max_lat)
-        .bind(route.min_lon)
-        .bind(route.max_lon)
-        .bind(&route.waypoints_json)
+        .bind(&r_ids)
+        .bind(&r_highways)
+        .bind(&r_dir_codes)
+        .bind(&r_dir_labels)
+        .bind(&r_display_names)
+        .bind(&r_corridor_ids)
+        .bind(&r_variant_ranks)
+        .bind(&r_distances)
+        .bind(&r_durations)
+        .bind(&r_intervals)
+        .bind(&r_point_counts)
+        .bind(&r_start_lats)
+        .bind(&r_start_lons)
+        .bind(&r_end_lats)
+        .bind(&r_end_lons)
+        .bind(&r_min_lats)
+        .bind(&r_max_lats)
+        .bind(&r_min_lons)
+        .bind(&r_max_lons)
+        .bind(&r_waypoints)
         .execute(&mut *tx)
         .await?;
     }
 
-    for anchor in &anchors {
+    // Batch insert anchors using UNNEST (critical — can be 100k+ rows)
+    const ANCHOR_BATCH: usize = 10_000;
+    for chunk in anchors.chunks(ANCHOR_BATCH) {
+        let mut a_route_ids = Vec::with_capacity(chunk.len());
+        let mut a_indices = Vec::with_capacity(chunk.len());
+        let mut a_lats = Vec::with_capacity(chunk.len());
+        let mut a_lons = Vec::with_capacity(chunk.len());
+
+        for anchor in chunk {
+            a_route_ids.push(anchor.route_id.as_str());
+            a_indices.push(anchor.anchor_index);
+            a_lats.push(anchor.lat);
+            a_lons.push(anchor.lon);
+        }
+
         sqlx::query(
             "INSERT INTO reference_route_anchors (route_id, anchor_index, lat, lon) \
-             VALUES ($1::uuid, $2, $3, $4)",
+             SELECT route_id::uuid, anchor_index, lat, lon \
+             FROM UNNEST($1::text[], $2::int[], $3::float8[], $4::float8[]) \
+              AS t(route_id, anchor_index, lat, lon)",
         )
-        .bind(&anchor.route_id)
-        .bind(anchor.anchor_index)
-        .bind(anchor.lat)
-        .bind(anchor.lon)
+        .bind(&a_route_ids)
+        .bind(&a_indices)
+        .bind(&a_lats)
+        .bind(&a_lons)
         .execute(&mut *tx)
         .await?;
     }

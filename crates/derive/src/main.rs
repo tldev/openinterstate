@@ -73,7 +73,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
 
 async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
     Ok(sqlx::postgres::PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(4)
         .connect(database_url)
         .await?)
 }
