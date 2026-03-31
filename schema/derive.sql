@@ -349,11 +349,13 @@ FROM (
         ) AS rank
     FROM exits e
     JOIN pois p
-      ON p.geom && ST_Expand(e.geom, 0.012)
-     AND ST_DWithin(e.geom::geography, p.geom::geography, 800.0)
+      ON p.geom && ST_Expand(e.geom,
+           CASE WHEN p.category IN ('park', 'dogPark') THEN 0.024 ELSE 0.012 END)
+     AND ST_DWithin(e.geom::geography, p.geom::geography,
+           CASE WHEN p.category IN ('park', 'dogPark') THEN 1600.0 ELSE 800.0 END)
     WHERE p.category IS NOT NULL
       AND p.category <> 'restroom'
-      AND (p.category = 'restArea' OR LOWER(TRIM(COALESCE(NULLIF(p.display_name, ''), NULLIF(p.name, ''), 'Unknown'))) <> 'unknown')
+      AND (p.category IN ('restArea', 'park', 'dogPark') OR LOWER(TRIM(COALESCE(NULLIF(p.display_name, ''), NULLIF(p.name, ''), 'Unknown'))) <> 'unknown')
       AND NOT EXISTS (
           SELECT 1
           FROM exit_poi_reachability prior
