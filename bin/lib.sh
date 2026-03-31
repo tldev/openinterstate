@@ -585,12 +585,14 @@ n/tourism=hotel,motel
 n/shop=gas
 n/cuisine
 n/highway=rest_area,services
+n/leisure=park,dog_park
 w/highway=construction
 w/highway=motorway,motorway_link,trunk,trunk_link,rest_area,services
 w/amenity=fuel,restaurant,fast_food,cafe,charging_station
 w/tourism=hotel,motel
 w/shop=gas
 w/cuisine
+w/leisure=park,dog_park
 EOF
 }
 
