@@ -335,6 +335,11 @@ FROM (
 ) src;
 
 
+-- Refresh planner statistics after bulk-loading exits and pois so the
+-- spatial join below uses accurate row estimates and index selectivity.
+ANALYZE exits;
+ANALYZE pois;
+
 INSERT INTO exit_poi_candidates (exit_id, poi_id, category, distance_m, rank)
 SELECT exit_id, poi_id, category, distance_m, rank
 FROM (

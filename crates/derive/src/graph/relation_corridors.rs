@@ -2353,47 +2353,120 @@ async fn write_corridors(
         .execute(&mut *tx)
         .await?;
 
-    for draft in drafts {
-        sqlx::query(
-            "INSERT INTO corridors \
-                (corridor_id, highway, canonical_direction, root_relation_id, geometry_json, source_way_ids_json) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(draft.corridor_id)
-        .bind(&draft.highway)
-        .bind(&draft.canonical_direction)
-        .bind(draft.root_relation_id)
-        .bind(&draft.geometry_json)
-        .bind(serde_json::to_string(&draft.source_way_ids).unwrap_or_else(|_| "[]".to_string()))
-        .execute(&mut *tx)
-        .await?;
+    // Batch insert corridors using UNNEST
+    {
+        let mut c_ids = Vec::with_capacity(drafts.len());
+        let mut c_highways = Vec::with_capacity(drafts.len());
+        let mut c_directions = Vec::with_capacity(drafts.len());
+        let mut c_relation_ids = Vec::with_capacity(drafts.len());
+        let mut c_geom_jsons = Vec::with_capacity(drafts.len());
+        let mut c_source_ways = Vec::with_capacity(drafts.len());
 
-        for (idx, exit) in draft.exits.iter().enumerate() {
+        for draft in drafts.iter() {
+            c_ids.push(draft.corridor_id);
+            c_highways.push(draft.highway.as_str());
+            c_directions.push(draft.canonical_direction.as_str());
+            c_relation_ids.push(draft.root_relation_id);
+            c_geom_jsons.push(draft.geometry_json.as_str());
+            c_source_ways.push(
+                serde_json::to_string(&draft.source_way_ids)
+                    .unwrap_or_else(|_| "[]".to_string()),
+            );
+        }
+        let c_source_ways_refs: Vec<&str> = c_source_ways.iter().map(|s| s.as_str()).collect();
+
+        const CORRIDOR_BATCH: usize = 500;
+        for (i, chunk_start) in (0..drafts.len()).step_by(CORRIDOR_BATCH).enumerate() {
+            let chunk_end = (chunk_start + CORRIDOR_BATCH).min(drafts.len());
+            sqlx::query(
+                "INSERT INTO corridors \
+                    (corridor_id, highway, canonical_direction, root_relation_id, geometry_json, source_way_ids_json) \
+                 SELECT corridor_id, highway, canonical_direction, root_relation_id, geometry_json, source_way_ids_json \
+                 FROM UNNEST($1::int[], $2::text[], $3::text[], $4::int8[], $5::text[], $6::text[]) \
+                  AS t(corridor_id, highway, canonical_direction, root_relation_id, geometry_json, source_way_ids_json)",
+            )
+            .bind(&c_ids[chunk_start..chunk_end])
+            .bind(&c_highways[chunk_start..chunk_end])
+            .bind(&c_directions[chunk_start..chunk_end])
+            .bind(&c_relation_ids[chunk_start..chunk_end])
+            .bind(&c_geom_jsons[chunk_start..chunk_end])
+            .bind(&c_source_ways_refs[chunk_start..chunk_end])
+            .execute(&mut *tx)
+            .await?;
+
+            let _ = i; // suppress unused
+        }
+    }
+
+    // Batch insert corridor exits using UNNEST
+    {
+        let mut ce_corridor_ids = Vec::new();
+        let mut ce_indices = Vec::new();
+        let mut ce_exit_ids = Vec::new();
+        let mut ce_refs: Vec<Option<String>> = Vec::new();
+        let mut ce_names: Vec<Option<String>> = Vec::new();
+        let mut ce_lats = Vec::new();
+        let mut ce_lons = Vec::new();
+
+        for draft in drafts.iter() {
+            for (idx, exit) in draft.exits.iter().enumerate() {
+                ce_corridor_ids.push(draft.corridor_id);
+                ce_indices.push(idx as i32);
+                ce_exit_ids.push(exit.exit_id.as_str());
+                ce_refs.push(exit.ref_val.clone());
+                ce_names.push(exit.name.clone());
+                ce_lats.push(exit.lat);
+                ce_lons.push(exit.lon);
+            }
+        }
+
+        const EXIT_BATCH: usize = 5_000;
+        for chunk_start in (0..ce_corridor_ids.len()).step_by(EXIT_BATCH) {
+            let chunk_end = (chunk_start + EXIT_BATCH).min(ce_corridor_ids.len());
             sqlx::query(
                 "INSERT INTO corridor_exits \
                     (corridor_id, corridor_index, exit_id, ref, name, lat, lon) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 SELECT corridor_id, corridor_index, exit_id, ref_val, name, lat, lon \
+                 FROM UNNEST($1::int[], $2::int[], $3::text[], $4::text[], $5::text[], $6::float8[], $7::float8[]) \
+                  AS t(corridor_id, corridor_index, exit_id, ref_val, name, lat, lon)",
             )
-            .bind(draft.corridor_id)
-            .bind(idx as i32)
-            .bind(&exit.exit_id)
-            .bind(&exit.ref_val)
-            .bind(&exit.name)
-            .bind(exit.lat)
-            .bind(exit.lon)
+            .bind(&ce_corridor_ids[chunk_start..chunk_end])
+            .bind(&ce_indices[chunk_start..chunk_end])
+            .bind(&ce_exit_ids[chunk_start..chunk_end])
+            .bind(&ce_refs[chunk_start..chunk_end])
+            .bind(&ce_names[chunk_start..chunk_end])
+            .bind(&ce_lats[chunk_start..chunk_end])
+            .bind(&ce_lons[chunk_start..chunk_end])
             .execute(&mut *tx)
             .await?;
         }
     }
 
+    // Batch update highway_edges corridor_id using UNNEST
     let mut edges_updated = 0usize;
-    for draft in drafts {
-        for edge_id in &draft.edge_ids {
-            let result = sqlx::query("UPDATE highway_edges SET corridor_id = $2 WHERE id = $1")
-                .bind(edge_id)
-                .bind(draft.corridor_id)
-                .execute(&mut *tx)
-                .await?;
+    {
+        let mut upd_edge_ids = Vec::new();
+        let mut upd_corridor_ids = Vec::new();
+
+        for draft in drafts.iter() {
+            for edge_id in &draft.edge_ids {
+                upd_edge_ids.push(edge_id.as_str());
+                upd_corridor_ids.push(draft.corridor_id);
+            }
+        }
+
+        const UPDATE_BATCH: usize = 5_000;
+        for chunk_start in (0..upd_edge_ids.len()).step_by(UPDATE_BATCH) {
+            let chunk_end = (chunk_start + UPDATE_BATCH).min(upd_edge_ids.len());
+            let result = sqlx::query(
+                "UPDATE highway_edges SET corridor_id = t.corridor_id \
+                 FROM UNNEST($1::text[], $2::int[]) AS t(id, corridor_id) \
+                 WHERE highway_edges.id = t.id",
+            )
+            .bind(&upd_edge_ids[chunk_start..chunk_end])
+            .bind(&upd_corridor_ids[chunk_start..chunk_end])
+            .execute(&mut *tx)
+            .await?;
             edges_updated += result.rows_affected() as usize;
         }
     }

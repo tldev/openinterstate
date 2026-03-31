@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# OpenInterstate pipeline benchmark harness.
+#
+# Downloads a small PBF (Rhode Island by default), runs the full pipeline
+# from scratch, and records per-stage wall-clock times to a JSON log.
+#
+# Usage:
+#   bin/benchmark-pipeline [--runs N] [--pbf-url URL] [--label LABEL] [--log FILE]
+#
+# Requires: docker (compose plugin)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# --- defaults ----------------------------------------------------------------
+
+RI_PBF_URL="https://download.geofabrik.de/north-america/us/rhode-island-latest.osm.pbf"
+PBF_URL="$RI_PBF_URL"
+RUNS=1
+LABEL=""
+LOG_FILE="$REPO_ROOT/benchmark-results.jsonl"
+DB_PORT="${OI_BENCH_DB_PORT:-55433}"
+DB_NAME="osm"
+DB_USER="osm"
+DB_PASSWORD="osm_dev"
+IMPORT_CACHE_MB="${OI_IMPORT_CACHE_MB:-2048}"
+BENCH_WORK_DIR="${OI_BENCH_WORK_DIR:-$REPO_ROOT/.bench}"
+
+# --- parse args --------------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --runs)       RUNS="$2";     shift 2 ;;
+    --pbf-url)    PBF_URL="$2";  shift 2 ;;
+    --label)      LABEL="$2";    shift 2 ;;
+    --log)        LOG_FILE="$2"; shift 2 ;;
+    --cache-mb)   IMPORT_CACHE_MB="$2"; shift 2 ;;
+    --work-dir)   BENCH_WORK_DIR="$2"; shift 2 ;;
+    -h|--help)
+      sed -n '2,/^$/s/^# \?//p' "$0"
+      exit 0
+      ;;
+    *) echo "unknown arg: $1" >&2; exit 1 ;;
+  esac
+done
+
+# --- helpers -----------------------------------------------------------------
+
+log() { echo "[$(date '+%H:%M:%S')] $*" >&2; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+epoch_ms() {
+  if command -v gdate >/dev/null 2>&1; then
+    gdate +%s%3N
+  elif date +%s%3N >/dev/null 2>&1; then
+    date +%s%3N
+  else
+    python3 -c 'import time; print(int(time.time()*1000))'
+  fi
+}
+
+time_stage() {
+  local name="$1"; shift
+  local t0 t1 elapsed_ms
+  log "▶ $name"
+  t0="$(epoch_ms)"
+  "$@"
+  t1="$(epoch_ms)"
+  elapsed_ms=$(( t1 - t0 ))
+  STAGE_TIMES+=("\"$name\": $elapsed_ms")
+  log "✓ $name  ${elapsed_ms}ms ($(( elapsed_ms / 1000 ))s)"
+}
+
+DB_CONTAINER=""
+cleanup() {
+  if [[ -n "$DB_CONTAINER" ]]; then
+    docker rm -f "$DB_CONTAINER" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+pg() {
+  PGPASSWORD="$DB_PASSWORD" psql \
+    -h 127.0.0.1 -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+    -v ON_ERROR_STOP=1 "$@"
+}
+
+runner() {
+  docker run --rm \
+    --network=host \
+    -v "$REPO_ROOT:/workspace" \
+    -v "$BENCH_WORK_DIR:/bench" \
+    -w /workspace \
+    -e PGPASSWORD="$DB_PASSWORD" \
+    openinterstate-bench-runner "$@"
+}
+
+# --- pre-flight checks -------------------------------------------------------
+
+command -v docker >/dev/null 2>&1 || die "docker is required"
+
+mkdir -p "$BENCH_WORK_DIR"/{source,postgres,state,releases,cache}
+
+# Build runner image (cached after first build)
+log "Ensuring runner image"
+docker build -q -t openinterstate-bench-runner \
+  -f "$REPO_ROOT/docker/runner/Dockerfile" "$REPO_ROOT" >/dev/null
+
+# Download PBF (cached)
+SOURCE_PBF="$BENCH_WORK_DIR/source/$(basename "$PBF_URL")"
+if [[ ! -f "$SOURCE_PBF" ]]; then
+  log "Downloading PBF: $PBF_URL"
+  curl -L --fail --progress-bar -o "$SOURCE_PBF" "$PBF_URL"
+else
+  log "Using cached PBF: $SOURCE_PBF"
+fi
+PBF_SIZE=$(stat -f '%z' "$SOURCE_PBF" 2>/dev/null || stat -c '%s' "$SOURCE_PBF")
+
+# --- run loop ----------------------------------------------------------------
+
+for (( run=1; run<=RUNS; run++ )); do
+  log "=== Run $run/$RUNS ==="
+  STAGE_TIMES=()
+
+  # Clean slate for each run
+  cleanup
+  DB_CONTAINER=""
+  rm -rf "$BENCH_WORK_DIR/postgres/db"
+  mkdir -p "$BENCH_WORK_DIR/postgres/db"
+
+  FILTERED_PBF="$BENCH_WORK_DIR/source/filtered.osm.pbf"
+  RELATION_CACHE="$BENCH_WORK_DIR/cache/interstate-relations.tsv"
+  DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${DB_PORT}/${DB_NAME}"
+
+  # --- stage: prefilter -----------------------------------------------------
+  time_stage "prefilter" \
+    runner osmium tags-filter \
+      "/bench/source/$(basename "$SOURCE_PBF")" \
+      n/highway=motorway_junction \
+      "n/amenity=fuel,restaurant,fast_food,cafe,charging_station" \
+      "n/tourism=hotel,motel" \
+      n/shop=gas \
+      n/cuisine \
+      "n/highway=rest_area,services" \
+      n/amenity=toilets \
+      w/highway=construction \
+      "w/highway=motorway,motorway_link,trunk,trunk_link,rest_area,services" \
+      "w/amenity=fuel,restaurant,fast_food,cafe,charging_station" \
+      "w/tourism=hotel,motel" \
+      w/shop=gas \
+      w/cuisine \
+      --overwrite \
+      -o "/bench/source/filtered.osm.pbf"
+
+  # --- stage: extract relations ---------------------------------------------
+  time_stage "extract_relations" \
+    runner python3 /workspace/tooling/extract_interstate_relations.py \
+      --source-pbf "/bench/source/$(basename "$SOURCE_PBF")" \
+      --output "/bench/cache/interstate-relations.tsv"
+
+  # --- stage: start database ------------------------------------------------
+  time_stage "start_db" bash -c '
+    DB_CONTAINER="openinterstate-bench-db-$$-'$run'"
+    docker run --detach --rm \
+      --name "$DB_CONTAINER" \
+      --shm-size 2g \
+      -e POSTGRES_DB='"$DB_NAME"' \
+      -e POSTGRES_USER='"$DB_USER"' \
+      -e POSTGRES_PASSWORD='"$DB_PASSWORD"' \
+      -p '"$DB_PORT"':5432 \
+      -v '"$BENCH_WORK_DIR"'/postgres/db:/var/lib/postgresql/data \
+      postgis/postgis:16-3.4 \
+      postgres \
+        -c shared_buffers=512MB \
+        -c effective_cache_size=2GB \
+        -c maintenance_work_mem=512MB \
+        -c work_mem=32MB \
+        -c max_wal_size=32GB \
+        -c min_wal_size=8GB \
+        -c checkpoint_timeout=60min \
+        -c checkpoint_completion_target=0.9 \
+        -c wal_compression=on \
+        -c wal_level=minimal \
+        -c max_wal_senders=0 \
+        -c archive_mode=off \
+        -c synchronous_commit=off \
+        -c fsync=off \
+        -c full_page_writes=off \
+        -c autovacuum=off \
+        -c effective_io_concurrency=200 \
+        -c random_page_cost=1.1 \
+      >/dev/null
+    echo "$DB_CONTAINER"
+  '
+
+  # Capture container name from the start_db stage
+  DB_CONTAINER="openinterstate-bench-db-$$-$run"
+
+  # Wait for postgres
+  log "Waiting for PostGIS..."
+  for (( i=1; i<=60; i++ )); do
+    if PGPASSWORD="$DB_PASSWORD" docker exec "$DB_CONTAINER" \
+      pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+
+  # Bootstrap
+  time_stage "bootstrap_schema" \
+    runner bash -c "
+      PGPASSWORD=$DB_PASSWORD psql -h host.docker.internal -p $DB_PORT -U $DB_USER -d $DB_NAME \
+        -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS postgis;' &&
+      PGPASSWORD=$DB_PASSWORD psql -h host.docker.internal -p $DB_PORT -U $DB_USER -d $DB_NAME \
+        -v ON_ERROR_STOP=1 -f /workspace/schema/bootstrap.sql
+    "
+
+  # --- stage: osm2pgsql import ----------------------------------------------
+  time_stage "osm2pgsql_import" \
+    runner bash -c "
+      PGPASSWORD=$DB_PASSWORD osm2pgsql \
+        --slim \
+        --create \
+        --output=flex \
+        --style=/workspace/schema/osm2pgsql/openinterstate.lua \
+        --database=$DB_NAME \
+        --host=host.docker.internal \
+        --port=$DB_PORT \
+        -U $DB_USER \
+        --cache=$IMPORT_CACHE_MB \
+        /bench/source/filtered.osm.pbf
+    "
+
+  # --- stage: derive SQL ----------------------------------------------------
+  time_stage "derive_sql" \
+    runner bash -c "
+      PGPASSWORD=$DB_PASSWORD psql \
+        -h host.docker.internal -p $DB_PORT -U $DB_USER -d $DB_NAME \
+        -v ON_ERROR_STOP=1 \
+        -f /workspace/schema/derive.sql
+    "
+
+  # --- stage: rust derive (graph + corridors + routes) ----------------------
+  time_stage "rust_derive" \
+    runner bash -c "
+      cargo run --locked --release -p openinterstate-derive -- \
+        --database-url 'postgres://$DB_USER:$DB_PASSWORD@host.docker.internal:$DB_PORT/$DB_NAME' \
+        --interstate-relation-cache /bench/cache/interstate-relations.tsv \
+        all
+    "
+
+  # --- stage: export release ------------------------------------------------
+  RELEASE_ID="bench-run-$run"
+  time_stage "export_release" \
+    runner bash -c "
+      python3 /workspace/tooling/export_release.py \
+        --database-url 'postgres://$DB_USER:$DB_PASSWORD@host.docker.internal:$DB_PORT/$DB_NAME' \
+        --release-id $RELEASE_ID \
+        --output-dir /bench/releases/$RELEASE_ID \
+        --state-dir /bench/state \
+        --source-pbf-file /bench/source/$(basename "$SOURCE_PBF") \
+        --import-pbf-file /bench/source/filtered.osm.pbf
+    "
+
+  # --- collect results ------------------------------------------------------
+  TOTAL_MS=0
+  for entry in "${STAGE_TIMES[@]}"; do
+    ms="${entry##*: }"
+    TOTAL_MS=$(( TOTAL_MS + ms ))
+  done
+
+  RESULT_JSON=$(cat <<ENDJSON
+{
+  "timestamp": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+  "label": "${LABEL:-baseline}",
+  "run": $run,
+  "pbf_url": "$PBF_URL",
+  "pbf_size_bytes": $PBF_SIZE,
+  "import_cache_mb": $IMPORT_CACHE_MB,
+  "total_ms": $TOTAL_MS,
+  "stages": { $(IFS=,; echo "${STAGE_TIMES[*]}") }
+}
+ENDJSON
+)
+
+  echo "$RESULT_JSON" >> "$LOG_FILE"
+  log "Total: ${TOTAL_MS}ms ($(( TOTAL_MS / 1000 ))s)"
+  log "Stages: $(IFS=,; echo "${STAGE_TIMES[*]}")"
+
+  # Cleanup for next run
+  cleanup
+  DB_CONTAINER=""
+done
+
+log "Results appended to $LOG_FILE"

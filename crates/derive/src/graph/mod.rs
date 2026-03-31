@@ -66,69 +66,130 @@ pub async fn build_graph(
         corridor_entries.len()
     );
 
-    // Write edges
+    // Write edges in batches using UNNEST for bulk insert
+    const EDGE_BATCH: usize = 5_000;
     let mut tx = pool.begin().await?;
-    for (i, edge) in edges.iter().enumerate() {
+    for (batch_idx, chunk) in edges.chunks(EDGE_BATCH).enumerate() {
+        let mut ids = Vec::with_capacity(chunk.len());
+        let mut highways = Vec::with_capacity(chunk.len());
+        let mut components = Vec::with_capacity(chunk.len());
+        let mut start_nodes = Vec::with_capacity(chunk.len());
+        let mut end_nodes = Vec::with_capacity(chunk.len());
+        let mut lengths = Vec::with_capacity(chunk.len());
+        let mut geom_wkts = Vec::with_capacity(chunk.len());
+        let mut min_lats = Vec::with_capacity(chunk.len());
+        let mut max_lats = Vec::with_capacity(chunk.len());
+        let mut min_lons = Vec::with_capacity(chunk.len());
+        let mut max_lons = Vec::with_capacity(chunk.len());
+        let mut polylines = Vec::with_capacity(chunk.len());
+        let mut source_ways = Vec::with_capacity(chunk.len());
+        let mut directions: Vec<Option<String>> = Vec::with_capacity(chunk.len());
+
+        for edge in chunk {
+            ids.push(edge.id.as_str());
+            highways.push(edge.highway.as_str());
+            components.push(edge.component);
+            start_nodes.push(edge.start_node);
+            end_nodes.push(edge.end_node);
+            lengths.push(edge.length_m);
+            geom_wkts.push(edge.geom_wkt.as_str());
+            min_lats.push(edge.min_lat);
+            max_lats.push(edge.max_lat);
+            min_lons.push(edge.min_lon);
+            max_lons.push(edge.max_lon);
+            polylines.push(edge.polyline_json.as_str());
+            source_ways.push(edge.source_way_ids_json.as_str());
+            directions.push(edge.direction.clone());
+        }
+
         sqlx::query(
             "INSERT INTO highway_edges \
              (id, highway, component, start_node, end_node, length_m, \
               geom, min_lat, max_lat, min_lon, max_lon, polyline_json, source_way_ids_json, direction) \
-             VALUES ($1, $2, $3, $4, $5, $6, \
-              ST_GeomFromText($7, 4326), $8, $9, $10, $11, $12, $13, $14) \
+             SELECT id, highway, component, start_node, end_node, length_m, \
+              ST_GeomFromText(geom_wkt, 4326), min_lat, max_lat, min_lon, max_lon, \
+              polyline_json, source_way_ids_json, direction \
+             FROM UNNEST($1::text[], $2::text[], $3::int[], $4::int8[], $5::int8[], $6::int[], \
+              $7::text[], $8::float8[], $9::float8[], $10::float8[], $11::float8[], \
+              $12::text[], $13::text[], $14::text[]) \
+              AS t(id, highway, component, start_node, end_node, length_m, \
+               geom_wkt, min_lat, max_lat, min_lon, max_lon, polyline_json, source_way_ids_json, direction) \
              ON CONFLICT (id) DO NOTHING",
         )
-        .bind(&edge.id)
-        .bind(&edge.highway)
-        .bind(edge.component)
-        .bind(edge.start_node)
-        .bind(edge.end_node)
-        .bind(edge.length_m)
-        .bind(&edge.geom_wkt)
-        .bind(edge.min_lat)
-        .bind(edge.max_lat)
-        .bind(edge.min_lon)
-        .bind(edge.max_lon)
-        .bind(&edge.polyline_json)
-        .bind(&edge.source_way_ids_json)
-        .bind(&edge.direction)
+        .bind(&ids)
+        .bind(&highways)
+        .bind(&components)
+        .bind(&start_nodes)
+        .bind(&end_nodes)
+        .bind(&lengths)
+        .bind(&geom_wkts)
+        .bind(&min_lats)
+        .bind(&max_lats)
+        .bind(&min_lons)
+        .bind(&max_lons)
+        .bind(&polylines)
+        .bind(&source_ways)
+        .bind(&directions)
         .execute(&mut *tx)
         .await?;
 
-        if (i + 1) % 10_000 == 0 {
-            tracing::info!("  edges: {}/{}", i + 1, edges.len());
+        let done = (batch_idx + 1) * EDGE_BATCH;
+        if done % 10_000 < EDGE_BATCH {
+            tracing::info!("  edges: {}/{}", done.min(edges.len()), edges.len());
         }
     }
     tx.commit().await?;
 
-    // Write corridor entries
+    // Write corridor entries in batches using UNNEST
+    const CORRIDOR_BATCH: usize = 5_000;
     let mut tx = pool.begin().await?;
-    let mut inserted = 0_usize;
-    for (i, entry) in corridor_entries.iter().enumerate() {
-        let result = sqlx::query(
+    for (batch_idx, chunk) in corridor_entries.chunks(CORRIDOR_BATCH).enumerate() {
+        let mut exit_ids = Vec::with_capacity(chunk.len());
+        let mut c_highways = Vec::with_capacity(chunk.len());
+        let mut c_components = Vec::with_capacity(chunk.len());
+        let mut c_node_ids = Vec::with_capacity(chunk.len());
+        let mut c_directions: Vec<Option<String>> = Vec::with_capacity(chunk.len());
+
+        for entry in chunk {
+            exit_ids.push(entry.exit_id.as_str());
+            c_highways.push(entry.highway.as_str());
+            c_components.push(entry.component);
+            c_node_ids.push(entry.node_id);
+            c_directions.push(entry.direction.clone());
+        }
+
+        sqlx::query(
             "INSERT INTO exit_corridors (exit_id, highway, graph_component, graph_node, direction) \
-             VALUES ($1, $2, $3, $4, $5) \
+             SELECT exit_id, highway, graph_component, graph_node, direction \
+             FROM UNNEST($1::text[], $2::text[], $3::int[], $4::int8[], $5::text[]) \
+              AS t(exit_id, highway, graph_component, graph_node, direction) \
              ON CONFLICT (exit_id, highway) DO UPDATE SET \
                graph_component = EXCLUDED.graph_component, \
                graph_node = EXCLUDED.graph_node, \
                direction = EXCLUDED.direction",
         )
-        .bind(&entry.exit_id)
-        .bind(&entry.highway)
-        .bind(entry.component)
-        .bind(entry.node_id)
-        .bind(&entry.direction)
+        .bind(&exit_ids)
+        .bind(&c_highways)
+        .bind(&c_components)
+        .bind(&c_node_ids)
+        .bind(&c_directions)
         .execute(&mut *tx)
         .await?;
-        if result.rows_affected() > 0 {
-            inserted += 1;
-        }
 
-        if (i + 1) % 10_000 == 0 {
-            tracing::info!("  corridor entries: {}/{}", i + 1, corridor_entries.len());
+        let done = (batch_idx + 1) * CORRIDOR_BATCH;
+        if done % 10_000 < CORRIDOR_BATCH {
+            tracing::info!(
+                "  corridor entries: {}/{}",
+                done.min(corridor_entries.len()),
+                corridor_entries.len()
+            );
         }
     }
     tx.commit().await?;
-    tracing::info!("  Inserted {} exit_corridors entries", inserted);
+    tracing::info!(
+        "  Inserted {} exit_corridors entries",
+        corridor_entries.len()
+    );
 
     Ok(edges.len())
 }
