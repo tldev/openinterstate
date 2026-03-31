@@ -12,7 +12,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="${OI_REPO_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 
 # --- defaults ----------------------------------------------------------------
 
@@ -81,12 +81,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-pg() {
-  PGPASSWORD="$DB_PASSWORD" psql \
-    -h 127.0.0.1 -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
-    -v ON_ERROR_STOP=1 "$@"
-}
-
 runner() {
   docker run --rm \
     --network=host \
@@ -101,7 +95,7 @@ runner() {
 
 command -v docker >/dev/null 2>&1 || die "docker is required"
 
-mkdir -p "$BENCH_WORK_DIR"/{source,postgres,state,releases,cache}
+mkdir -p "$BENCH_WORK_DIR"/{source,state,releases,cache}
 
 # Build runner image (cached after first build)
 log "Ensuring runner image"
@@ -127,8 +121,6 @@ for (( run=1; run<=RUNS; run++ )); do
   # Clean slate for each run
   cleanup
   DB_CONTAINER=""
-  rm -rf "$BENCH_WORK_DIR/postgres/db"
-  mkdir -p "$BENCH_WORK_DIR/postgres/db"
 
   FILTERED_PBF="$BENCH_WORK_DIR/source/filtered.osm.pbf"
   RELATION_CACHE="$BENCH_WORK_DIR/cache/interstate-relations.tsv"
@@ -161,16 +153,15 @@ for (( run=1; run<=RUNS; run++ )); do
       --output "/bench/cache/interstate-relations.tsv"
 
   # --- stage: start database ------------------------------------------------
-  time_stage "start_db" bash -c '
-    DB_CONTAINER="openinterstate-bench-db-$$-'$run'"
+  DB_CONTAINER="openinterstate-bench-db-$$-$run"
+  start_db_fn() {
     docker run --detach --rm \
       --name "$DB_CONTAINER" \
       --shm-size 2g \
-      -e POSTGRES_DB='"$DB_NAME"' \
-      -e POSTGRES_USER='"$DB_USER"' \
-      -e POSTGRES_PASSWORD='"$DB_PASSWORD"' \
-      -p '"$DB_PORT"':5432 \
-      -v '"$BENCH_WORK_DIR"'/postgres/db:/var/lib/postgresql/data \
+      -e POSTGRES_DB="$DB_NAME" \
+      -e POSTGRES_USER="$DB_USER" \
+      -e POSTGRES_PASSWORD="$DB_PASSWORD" \
+      -p "${DB_PORT}:5432" \
       postgis/postgis:16-3.4 \
       postgres \
         -c shared_buffers=512MB \
@@ -192,18 +183,16 @@ for (( run=1; run<=RUNS; run++ )); do
         -c effective_io_concurrency=200 \
         -c random_page_cost=1.1 \
       >/dev/null
-    echo "$DB_CONTAINER"
-  '
+  }
+  time_stage "start_db" start_db_fn
 
-  # Capture container name from the start_db stage
-  DB_CONTAINER="openinterstate-bench-db-$$-$run"
-
-  # Wait for postgres
+  # Wait for postgres to accept connections (from inside and via TCP from runner)
   log "Waiting for PostGIS..."
-  for (( i=1; i<=60; i++ )); do
-    if PGPASSWORD="$DB_PASSWORD" docker exec "$DB_CONTAINER" \
-      pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; then
-      break
+  for (( i=1; i<=120; i++ )); do
+    if docker exec "$DB_CONTAINER" pg_isready -U "$DB_USER" -d "$DB_NAME" >/dev/null 2>&1; then
+      if runner bash -c "PGPASSWORD=$DB_PASSWORD psql -h host.docker.internal -p $DB_PORT -U $DB_USER -d $DB_NAME -Atc 'SELECT 1'" >/dev/null 2>&1; then
+        break
+      fi
     fi
     sleep 1
   done
