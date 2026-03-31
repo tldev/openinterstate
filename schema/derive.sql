@@ -349,7 +349,8 @@ FROM (
         ) AS rank
     FROM exits e
     JOIN pois p
-      ON p.geom && ST_Expand(e.geom, 0.024)
+      ON p.geom && ST_Expand(e.geom,
+           CASE WHEN p.category IN ('park', 'dogPark') THEN 0.024 ELSE 0.012 END)
      AND ST_DWithin(e.geom::geography, p.geom::geography,
            CASE WHEN p.category IN ('park', 'dogPark') THEN 1600.0 ELSE 800.0 END)
     WHERE p.category IS NOT NULL
