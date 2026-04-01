@@ -365,10 +365,8 @@ FROM (
         ) AS rank
     FROM exits e
     JOIN pois p
-      ON p.geom && ST_Expand(e.geom,
-           CASE WHEN p.category IN ('park', 'dogPark') THEN 0.024 ELSE 0.012 END)
-     AND ST_DWithin(e.geom::geography, p.geom::geography,
-           CASE WHEN p.category IN ('park', 'dogPark') THEN 1600.0 ELSE 800.0 END)
+      ON p.geom && ST_Expand(e.geom, 0.024)
+     AND ST_DWithin(e.geom::geography, p.geom::geography, 1600.0)
     WHERE p.category IS NOT NULL
       AND p.category <> 'restroom'
       AND (p.category IN ('restArea', 'park', 'dogPark') OR LOWER(TRIM(COALESCE(NULLIF(p.display_name, ''), NULLIF(p.name, ''), 'Unknown'))) <> 'unknown')
@@ -380,7 +378,8 @@ FROM (
             AND prior.reachable = FALSE
       )
 ) ranked
-WHERE rank <= 12;
+WHERE rank <= 12
+  AND (category IN ('park', 'dogPark') OR distance_m <= 800);
 
 -- Drop direction-labeled rest areas that explicitly conflict with exit travel
 -- direction (for example, "eastbound" at a westbound exit).
