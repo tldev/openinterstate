@@ -73,7 +73,11 @@ local function classify_poi(tags)
         return "dogPark"
     end
     if leisure == "park" then
-        return "park"
+        local name = tags.name or ""
+        if name ~= "" and string.find(string.lower(name), "park") then
+            return "park"
+        end
+        return nil
     end
     return nil
 end
