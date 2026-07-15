@@ -15,7 +15,7 @@ The repo is organized around one job:
 If Docker is installed, this works from a fresh clone:
 
 ```bash
-./bin/openinterstate --data-parent /Volumes/goose-drive/openinterstate build
+./bin/openinterstate --data-parent /path/to/openinterstate-data build
 ```
 
 That command downloads `us-latest.osm.pbf`, starts PostGIS, imports canonical
@@ -23,12 +23,12 @@ OSM, derives product tables, and writes a release under a workspace chosen from
 the source PBF SHA-256:
 
 ```text
-/Volumes/goose-drive/openinterstate/workspaces/pbf-sha256/<sha256>
+/path/to/openinterstate-data/workspaces/pbf-sha256/<sha256>
 ```
 
 Raw source downloads are shared under
-`/Volumes/goose-drive/openinterstate/source-cache/`, and Cargo cache is shared
-under `/Volumes/goose-drive/openinterstate/cache/cargo/` so Rust builds are
+`/path/to/openinterstate-data/source-cache/`, and Cargo cache is shared
+under `/path/to/openinterstate-data/cache/cargo/` so Rust builds are
 reused across PBF workspaces.
 
 If you want release artifacts in a separate folder, set an explicit release
@@ -36,8 +36,8 @@ root:
 
 ```bash
 ./bin/openinterstate \
-  --data-parent /Volumes/goose-drive/openinterstate \
-  --release-dir /Volumes/goose-drive/openinterstate/releases \
+  --data-parent /path/to/openinterstate-data \
+  --release-dir /path/to/openinterstate-data/releases \
   build
 ```
 

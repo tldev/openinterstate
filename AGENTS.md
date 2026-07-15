@@ -1,13 +1,21 @@
 # OpenInterstate Agent Notes
 
-## Default Workspace
+## Data Workspace
 
-- Default the managed parent root to `/Volumes/goose-drive/openinterstate`.
-- In normal operation, do not choose an explicit `OI_DATA_ROOT` up front. Instead, resolve the source PBF first, hash it with SHA-256, and use the workspace path `/Volumes/goose-drive/openinterstate/workspaces/pbf-sha256/<sha256>`.
-- Treat `/Volumes/goose-drive/openinterstate/source-cache` as the shared raw-source download cache.
-- Treat `/Volumes/goose-drive/openinterstate/cache/cargo` as the shared Rust build cache across all PBF workspaces.
-- Let release artifacts default under the selected PBF workspace, which means `<workspace>/releases`, unless the user explicitly overrides the release root.
-- Only use `--data-dir` or `OI_DATA_ROOT` when the user explicitly asks to pin an exact workspace path and bypass the SHA-derived default.
+- All pipeline data lives outside the repo under a per-machine data parent,
+  passed as `--data-parent <path>`. Never assume a specific mount point;
+  ask for or discover the configured location.
+- In normal operation, do not choose an explicit `OI_DATA_ROOT` up front.
+  Instead, resolve the source PBF first, hash it with SHA-256, and use the
+  workspace path `<data-parent>/workspaces/pbf-sha256/<sha256>`.
+- Treat `<data-parent>/source-cache` as the shared raw-source download cache.
+- Treat `<data-parent>/cache/cargo` as the shared Rust build cache across all
+  PBF workspaces.
+- Let release artifacts default under the selected PBF workspace
+  (`<workspace>/releases`) unless the user explicitly overrides the release
+  root with `--release-dir`.
+- Only use `--data-dir` or `OI_DATA_ROOT` when the user explicitly asks to pin
+  an exact workspace path and bypass the SHA-derived default.
 
 ## Import And Derive Workflow
 
@@ -19,45 +27,16 @@
 
 ## Operational Bias
 
-- When discussing or running local build commands, default to `--data-parent /Volumes/goose-drive/openinterstate` rather than a repo-local `.data/` directory or a hard-coded workspace path.
+- When discussing or running local build commands, default to the configured
+  `--data-parent` rather than a repo-local `.data/` directory or a hard-coded
+  workspace path.
 - If derive-stage work is requested, start from the assumption that the existing canonical import should be preserved and reused.
 - If a re-import is required, explain why it is necessary before doing it.
 
-## Pike SQLite Follow-On
+## Downstream Consumers
 
-- Pack builds are automated for published releases: an openinterstate release
-  feeds the openinterstate-reachability scoring run, whose release triggers
-  Pike's Build Pack workflow, and media-server's Pike Release workflow deploys
-  the pack. A local OpenInterstate export does not require a manual Pike build.
-- To validate a local export against Pike before publishing, build a pack from
-  the archive using Pike's pipeline from `/Users/tjohnell/projects/pike/server`:
-  `./pike-pipeline.sh build --release-file /abs/path/openinterstate-release-<release-id>.tar.gz`
-  (add `--reachability-release-tag <score-tag>` to pin scores).
-- Let Pike keep its own default output locations unless the user asks otherwise.
-  The current default host pack output is `/Users/tjohnell/projects/pike/server/.data/packs/pike.sqlite`.
-- After a local Pike build, validate the pack with `sqlite3` by checking
-  `PRAGMA integrity_check;` and confirming the `meta` table reports the
-  matching `openinterstate_release_id`.
-
-## Named Comparison: Pike Interstate Exit Coverage Diff
-
-- If the user asks to rerun the comparison, refer to it as `Pike Interstate Exit Coverage Diff`.
-- Purpose: compare the latest OpenInterstate-derived Pike pack against the latest published Pike release pack, limited to Interstate corridor and exit coverage.
-- Inputs:
-  - OpenInterstate-derived Pike pack: `/Users/tjohnell/projects/pike/server/.data/packs/pike.sqlite`
-  - Latest published Pike release pack on NFS: newest `/Volumes/goose-plex-media/pike/releases/*/pike.sqlite`
-- Before comparing, stage the latest published Pike release pack off NFS into `/Users/tjohnell/projects/pike/server/.data/compare/`. If a same-size, same-mtime local staged copy already exists, reuse it instead of copying again.
-- Compare by `highway + canonical_direction`, starting from the OpenInterstate-derived pack's Interstate routes.
-- Union exits across duplicate corridor rows for the same `highway + canonical_direction` key before counting or diffing.
-- For route-level exit comparison, use distinct exit `ref` values when present. If a route has no usable `ref` values, fall back to a stable label such as `name` or `exit_id`.
-- Separate findings into at least three buckets:
-  - likely real gaps where the published Pike release is a near-superset of the OpenInterstate-derived route
-  - likely real gaps where the OpenInterstate-derived route is a near-superset of the published Pike release
-  - likely key pollution or route conflation where one side has far more exits and low overlap
-- Always report:
-  - route-level counts for both packs
-  - shared exit count
-  - exits only in OpenInterstate-derived pack
-  - exits only in published Pike release
-  - a short list of representative exit refs from each side for the biggest differences
-- Write a durable comparison CSV into `/Users/tjohnell/projects/pike/server/.data/compare/` named like `openinterstate-<release-id>-vs-pike-<release-stamp>-route-exit-compare.csv`.
+- OpenInterstate is the upstream data layer. Do not encode consumer-specific
+  behavior, names, or paths in this repo; downstream projects consume the
+  published releases and `datapackage.json` contract.
+- Published releases feed the separate `tldev/openinterstate-reachability`
+  scoring pipeline, which publishes drive-time scores as its own release.
