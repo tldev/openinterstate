@@ -83,14 +83,13 @@ every iteration.
 - `tooling/`: release export and CI release scripts
 - `crates/core/`: shared Rust geometry and highway helpers
 - `crates/derive/`: Rust builders for graph, corridors, and reference routes
-- `docs/`: roadmap, status, and release issue notes
+- `datapackage.json`: machine-readable schema for every public table (Data Package standard)
 - `schemas/`: public manifest schemas
 - `examples/`: example consumer queries
 
 ## Start Here
 
-- [Roadmap](docs/roadmap.md)
-- [Program status](docs/program_status.md)
+- [Public table schema](datapackage.json), also rendered at https://openinterstate.org/schema
 - [Contributing](CONTRIBUTING.md)
 
 ## Project Boundary
@@ -111,8 +110,10 @@ The current public release contains:
 4. exit aliases
 5. places
 6. exit-place links
-7. exit-place scores
-8. reference routes
+7. reference routes
+
+Drive-time reachability scores are published separately by
+`tldev/openinterstate-reachability`.
 
 The internal canonical database is broader than the public release. It keeps
 supporting highway context and POIs needed for derivation, but the exported
