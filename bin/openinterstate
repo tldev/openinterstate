@@ -17,16 +17,16 @@ Commands:
   publish          Publish a built release to GitHub
 
 Default hash-addressed workspace:
-  ./bin/openinterstate --data-parent /Volumes/goose-drive/openinterstate build
+  ./bin/openinterstate --data-parent /path/to/openinterstate-data build
 
 Explicit release output:
   ./bin/openinterstate \
-    --data-parent /Volumes/goose-drive/openinterstate \
-    --release-dir /Volumes/goose-drive/openinterstate/releases \
+    --data-parent /path/to/openinterstate-data \
+    --release-dir /path/to/openinterstate-data/releases \
     build
 
 Explicit workspace override:
-  ./bin/openinterstate --data-dir /Volumes/goose-drive/openinterstate/workspaces/pbf-sha256/<sha256> build
+  ./bin/openinterstate --data-dir /path/to/openinterstate-data/workspaces/pbf-sha256/<sha256> build
 USAGE
 }
 

@@ -231,7 +231,11 @@ oi_set_defaults() {
   if [[ "$OI_DATA_ROOT_IS_EXPLICIT" == true ]]; then
     OI_DATA_PARENT="$(oi_abs_path "${OI_DATA_PARENT:-$OI_DATA_ROOT}")"
   else
-    OI_DATA_PARENT="$(oi_abs_path "${OI_DATA_PARENT:-/Volumes/goose-drive/openinterstate}")"
+    if [[ -z "${OI_DATA_PARENT:-}" ]]; then
+      echo "OI_DATA_PARENT is not set. Pass --data-parent <path> (or set OI_DATA_PARENT) to choose where pipeline data lives." >&2
+      exit 1
+    fi
+    OI_DATA_PARENT="$(oi_abs_path "$OI_DATA_PARENT")"
   fi
   OI_SOURCE_CACHE_DIR="$(oi_abs_path "${OI_SOURCE_CACHE_DIR:-$OI_DATA_PARENT/source-cache}")"
   OI_INDEX_DIR="$(oi_abs_path "${OI_INDEX_DIR:-$OI_DATA_PARENT/index}")"
