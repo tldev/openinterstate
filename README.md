@@ -3,10 +3,11 @@
 OpenInterstate publishes open, versioned datasets of the United States
 interstate highway system, derived from OpenStreetMap.
 
-Getting usable interstate data out of raw OSM requires planet-file
-processing, a spatial database, and a stack of conflation heuristics. This
-project does that work once per release and ships the result as plain CSV, so
-consumers can skip straight to the data.
+Getting usable interstate data out of raw OSM means downloading planet-scale
+files, standing up a spatial database, and untangling how thousands of
+mappers labeled the same roads. This project does that work once per release
+and ships the result as plain CSV, so consumers can skip straight to the
+data.
 
 ## Get the data
 
