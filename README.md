@@ -83,19 +83,14 @@ every iteration.
 - `tooling/`: release export and CI release scripts
 - `crates/core/`: shared Rust geometry and highway helpers
 - `crates/derive/`: Rust builders for graph, corridors, and reference routes
-- `docs/`: project scope, contract, roadmap, and release docs
+- `docs/`: roadmap, status, and release issue notes
 - `schemas/`: public manifest schemas
 - `examples/`: example consumer queries
 
 ## Start Here
 
-- [Release build guide](docs/release_build.md)
-- [Project charter](docs/charter.md)
-- [Data contract draft](docs/data_contract_draft.md)
-- [Release format](docs/release_format.md)
 - [Roadmap](docs/roadmap.md)
 - [Program status](docs/program_status.md)
-- [Licensing and attribution notes](docs/licensing_and_attribution.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## Project Boundary

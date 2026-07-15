@@ -1,0 +1,162 @@
+{
+  "$schema": "https://datapackage.org/profiles/2.0/datapackage.json",
+  "name": "openinterstate",
+  "title": "OpenInterstate",
+  "description": "Structured US interstate highway data derived from OpenStreetMap: directional corridors, normalized exits, linked places, and reference routes, published as dated, checksummed releases.",
+  "version": "release-2026-07-13-gha-33",
+  "homepage": "https://openinterstate.org",
+  "licenses": [
+    {
+      "name": "ODbL-1.0",
+      "title": "Open Data Commons Open Database License 1.0",
+      "path": "https://opendatacommons.org/licenses/odbl/1-0/"
+    }
+  ],
+  "sources": [
+    {
+      "title": "OpenStreetMap via the Geofabrik US extract",
+      "path": "https://download.geofabrik.de/north-america/us-latest.osm.pbf"
+    }
+  ],
+  "resources": [
+    {
+      "name": "corridors",
+      "path": "csv/corridors.csv",
+      "format": "csv",
+      "mediatype": "text/csv",
+      "description": "Contiguous directional interstate corridors.",
+      "schema": {
+        "primaryKey": ["corridor_id"],
+        "fields": [
+          { "name": "corridor_id", "type": "integer", "description": "Stable identifier for one directional corridor." },
+          { "name": "interstate_name", "type": "string", "description": "Interstate the corridor belongs to, like I-10." },
+          { "name": "direction_code", "type": "string", "description": "Canonical travel direction, like east." },
+          { "name": "direction_label", "type": "string", "description": "Capitalized form of direction_code." },
+          { "name": "geometry_geojson", "type": "geojson", "description": "Corridor geometry as GeoJSON LineString or MultiLineString text." },
+          { "name": "edge_count", "type": "integer", "description": "Number of graph edges assigned to the corridor." }
+        ]
+      }
+    },
+    {
+      "name": "corridor_edges",
+      "path": "csv/corridor_edges.csv",
+      "format": "csv",
+      "mediatype": "text/csv",
+      "description": "Graph edges assigned to corridors.",
+      "schema": {
+        "primaryKey": ["edge_id"],
+        "foreignKeys": [
+          { "fields": ["corridor_id"], "reference": { "resource": "corridors", "fields": ["corridor_id"] } }
+        ],
+        "fields": [
+          { "name": "edge_id", "type": "string", "description": "Deterministic edge identifier, like edge/I-35E/10125498410/82123455." },
+          { "name": "corridor_id", "type": "integer", "description": "Corridor the edge belongs to." },
+          { "name": "interstate_name", "type": "string", "description": "Interstate of the parent corridor." },
+          { "name": "direction_code", "type": "string", "description": "Canonical direction of the parent corridor." },
+          { "name": "length_m", "type": "number", "description": "Edge length in meters." },
+          { "name": "geometry_geojson", "type": "geojson", "description": "Edge geometry as GeoJSON LineString text." }
+        ]
+      }
+    },
+    {
+      "name": "corridor_exits",
+      "path": "csv/corridor_exits.csv",
+      "format": "csv",
+      "mediatype": "text/csv",
+      "description": "Normalized exits linked to a corridor.",
+      "schema": {
+        "primaryKey": ["exit_id"],
+        "foreignKeys": [
+          { "fields": ["corridor_id"], "reference": { "resource": "corridors", "fields": ["corridor_id"] } }
+        ],
+        "fields": [
+          { "name": "exit_id", "type": "string", "description": "OSM-derived exit identifier, like node/338162665." },
+          { "name": "corridor_id", "type": "integer", "description": "Corridor the exit sits on." },
+          { "name": "interstate_name", "type": "string", "description": "Interstate of the parent corridor." },
+          { "name": "direction_code", "type": "string", "description": "Canonical direction of the parent corridor." },
+          { "name": "sequence_index", "type": "integer", "description": "Zero-based position of the exit along the corridor." },
+          { "name": "exit_number", "type": "string", "description": "Posted exit number from OSM, like 1A. May be empty." },
+          { "name": "exit_name", "type": "string", "description": "Exit name from OSM. May be empty." },
+          { "name": "lat", "type": "number", "description": "Exit latitude in WGS84." },
+          { "name": "lon", "type": "number", "description": "Exit longitude in WGS84." },
+          { "name": "geometry_geojson", "type": "geojson", "description": "Exit location as GeoJSON Point text." }
+        ]
+      }
+    },
+    {
+      "name": "exit_aliases",
+      "path": "csv/exit_aliases.csv",
+      "format": "csv",
+      "mediatype": "text/csv",
+      "description": "Source exit aliases mapped to normalized exits.",
+      "note": "Ships empty in the current release. The alias-normalization layer is not yet populated.",
+      "schema": {
+        "fields": [
+          { "name": "canonical_exit_id", "type": "string", "description": "Normalized exit that aliases collapse into." },
+          { "name": "source_exit_id", "type": "string", "description": "Source exit mapped onto the canonical exit." }
+        ]
+      }
+    },
+    {
+      "name": "places",
+      "path": "csv/places.csv",
+      "format": "csv",
+      "mediatype": "text/csv",
+      "description": "Reachable places and services.",
+      "schema": {
+        "primaryKey": ["place_id"],
+        "fields": [
+          { "name": "place_id", "type": "string", "description": "OSM-derived place identifier, like node/10000051746." },
+          { "name": "category", "type": "string", "description": "Place category, like evCharging or restArea." },
+          { "name": "name", "type": "string", "description": "Name from OSM." },
+          { "name": "display_name", "type": "string", "description": "Name prepared for display." },
+          { "name": "brand", "type": "string", "description": "Brand from OSM. May be empty." },
+          { "name": "geometry_geojson", "type": "geojson", "description": "Place location as GeoJSON Point text." }
+        ]
+      }
+    },
+    {
+      "name": "exit_place_links",
+      "path": "csv/exit_place_links.csv",
+      "format": "csv",
+      "mediatype": "text/csv",
+      "description": "Spatial proximity links between exits and places.",
+      "schema": {
+        "primaryKey": ["exit_id", "place_id"],
+        "foreignKeys": [
+          { "fields": ["exit_id"], "reference": { "resource": "corridor_exits", "fields": ["exit_id"] } },
+          { "fields": ["place_id"], "reference": { "resource": "places", "fields": ["place_id"] } }
+        ],
+        "fields": [
+          { "name": "exit_id", "type": "string", "description": "Exit side of the link. Joins corridor_exits.exit_id." },
+          { "name": "place_id", "type": "string", "description": "Place side of the link. Joins places.place_id." },
+          { "name": "category", "type": "string", "description": "Category of the linked place." },
+          { "name": "distance_m", "type": "number", "description": "Distance from exit to place in meters." },
+          { "name": "rank", "type": "integer", "description": "Proximity rank of the place for this exit, starting at 1." }
+        ]
+      }
+    },
+    {
+      "name": "reference_routes",
+      "path": "csv/reference_routes.csv",
+      "format": "csv",
+      "mediatype": "text/csv",
+      "description": "Routes for QA, examples, and exploration.",
+      "note": "Only corridors that meet the route-builder thresholds are emitted. Short corridors may appear in corridors.csv without a matching reference route.",
+      "schema": {
+        "primaryKey": ["reference_route_id"],
+        "fields": [
+          { "name": "reference_route_id", "type": "string", "format": "uuid", "description": "Deterministic route identifier." },
+          { "name": "interstate_name", "type": "string", "description": "Interstate the route follows, like I-10." },
+          { "name": "direction_code", "type": "string", "description": "Compact direction code, like EB." },
+          { "name": "direction_label", "type": "string", "description": "Readable direction, like Eastbound." },
+          { "name": "display_name", "type": "string", "description": "Route name, like I-10 Eastbound." },
+          { "name": "distance_m", "type": "number", "description": "Route distance in meters." },
+          { "name": "duration_s", "type": "number", "description": "Estimated drive time in seconds." },
+          { "name": "point_count", "type": "integer", "description": "Number of coordinates in the route geometry." },
+          { "name": "geometry_geojson", "type": "geojson", "description": "Route geometry as GeoJSON LineString or MultiLineString text." }
+        ]
+      }
+    }
+  ]
+}

@@ -165,19 +165,3 @@ CREATE TABLE IF NOT EXISTS reference_route_anchors (
 CREATE INDEX IF NOT EXISTS reference_route_anchors_lat_lon_idx
     ON reference_route_anchors (lat, lon);
 
-CREATE TABLE IF NOT EXISTS exit_poi_reachability (
-    exit_id TEXT NOT NULL,
-    poi_id TEXT NOT NULL,
-    route_distance_m INTEGER,
-    route_duration_s INTEGER,
-    reachable BOOLEAN NOT NULL DEFAULT FALSE,
-    reachability_score DOUBLE PRECISION,
-    reachability_confidence DOUBLE PRECISION,
-    provider TEXT NOT NULL DEFAULT 'osrm',
-    provider_dataset_version TEXT,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (exit_id, poi_id)
-);
-CREATE INDEX IF NOT EXISTS exit_poi_reachability_exit_idx
-    ON exit_poi_reachability (exit_id);
-

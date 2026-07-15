@@ -180,22 +180,6 @@ CREATE TABLE IF NOT EXISTS reference_route_anchors (
 CREATE INDEX IF NOT EXISTS reference_route_anchors_lat_lon_idx
     ON reference_route_anchors (lat, lon);
 
-CREATE TABLE IF NOT EXISTS exit_poi_reachability (
-    exit_id TEXT NOT NULL,
-    poi_id TEXT NOT NULL,
-    route_distance_m INTEGER,
-    route_duration_s INTEGER,
-    reachable BOOLEAN NOT NULL DEFAULT FALSE,
-    reachability_score DOUBLE PRECISION,
-    reachability_confidence DOUBLE PRECISION,
-    provider TEXT NOT NULL DEFAULT 'osrm',
-    provider_dataset_version TEXT,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (exit_id, poi_id)
-);
-CREATE INDEX IF NOT EXISTS exit_poi_reachability_exit_idx
-    ON exit_poi_reachability (exit_id);
-
 DO $$
 BEGIN
     IF to_regclass('public.osm2pgsql_v2_exits_nodes') IS NULL
@@ -207,7 +191,6 @@ BEGIN
     END IF;
 END $$;
 
--- Preserve reachability history/cache rows across derive runs.
 -- highway_edges and exit_corridors are rebuilt by --build-graph-only (runs after this SQL).
 TRUNCATE
     exits,
@@ -370,13 +353,6 @@ FROM (
     WHERE p.category IS NOT NULL
       AND p.category <> 'restroom'
       AND (p.category IN ('restArea', 'park', 'dogPark') OR LOWER(TRIM(COALESCE(NULLIF(p.display_name, ''), NULLIF(p.name, ''), 'Unknown'))) <> 'unknown')
-      AND NOT EXISTS (
-          SELECT 1
-          FROM exit_poi_reachability prior
-          WHERE prior.exit_id = e.id
-            AND prior.poi_id = p.id
-            AND prior.reachable = FALSE
-      )
 ) ranked
 WHERE rank <= 12
   AND (category IN ('park', 'dogPark') OR distance_m <= 800);
