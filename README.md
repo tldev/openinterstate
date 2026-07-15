@@ -1,130 +1,92 @@
 # OpenInterstate
 
-OpenInterstate turns raw OpenStreetMap interstate data into reusable public
-datasets for the United States.
+OpenInterstate publishes open, versioned datasets of the United States
+interstate highway system, derived from OpenStreetMap.
 
-The repo is organized around one job:
+Getting usable interstate data out of raw OSM requires planet-file
+processing, a spatial database, and a stack of conflation heuristics. This
+project does that work once per release and ships the result as plain CSV, so
+consumers can skip straight to the data.
 
-1. pull source data
-2. import canonical OSM plus supporting road and POI context into local PostGIS
-3. derive corridors, exits, places, and reference routes from that canonical store
-4. export a dated interstate-focused public release with lineage
+## Get the data
 
-## One Command Local Run
+Every release is a dated, checksummed tarball on the
+[releases page](https://github.com/tldev/openinterstate/releases):
 
-If Docker is installed, this works from a fresh clone:
+```bash
+gh release download --repo tldev/openinterstate --pattern '*.tar.gz'
+```
+
+A release contains seven CSV tables plus GPX reference routes, GeoJSON
+examples, a manifest, checksums, and source lineage:
+
+| Table | Contents |
+| --- | --- |
+| `corridors` | Contiguous directional interstate corridors |
+| `corridor_edges` | Graph edges assigned to corridors |
+| `corridor_exits` | Normalized exits linked to a corridor |
+| `exit_aliases` | Source exit aliases mapped to normalized exits (currently empty) |
+| `places` | Reachable places and services |
+| `exit_place_links` | Spatial proximity links between exits and places |
+| `reference_routes` | Routes for QA, examples, and exploration |
+
+Every table and column is documented in [datapackage.json](datapackage.json)
+(Data Package standard) and rendered at <https://openinterstate.org/schema>.
+Example DuckDB queries live in [examples/duckdb](examples/duckdb).
+
+## Scope
+
+Releases cover signed interstates only, including lettered branches such as
+`I-35E` and `I-69C`. OpenInterstate is an upstream data layer: it does not
+define consumer packaging or application-specific contracts. Drive-time
+reachability scores are published separately by
+[openinterstate-reachability](https://github.com/tldev/openinterstate-reachability).
+
+## How it works
+
+```
+us-latest.osm.pbf (Geofabrik)
+  -> osmium prefilter (interstate-relevant ways, exits, POIs)
+  -> osm2pgsql flex import into PostGIS
+  -> SQL and Rust derive stages (graph, corridors, exits, routes)
+  -> CSV export with manifest, checksums, and lineage
+```
+
+Releases are built by the `Release Build` GitHub Actions workflow, triggered
+manually with an opt-in publish step. Pull requests run the same mechanics
+against a small Rhode Island extract as a smoke test.
+
+## Build it yourself
+
+Docker is the only requirement:
 
 ```bash
 ./bin/openinterstate --data-parent /path/to/openinterstate-data build
 ```
 
-That command downloads `us-latest.osm.pbf`, starts PostGIS, imports canonical
-OSM, derives product tables, and writes a release under a workspace chosen from
-the source PBF SHA-256:
+This downloads the source PBF, starts PostGIS, imports and derives, and
+writes a release under a workspace keyed by the source file's SHA-256.
+Re-runs skip stages whose inputs have not changed. Add `--release-dir <path>`
+to collect release artifacts in one place.
 
-```text
-/path/to/openinterstate-data/workspaces/pbf-sha256/<sha256>
-```
+## Repository layout
 
-Raw source downloads are shared under
-`/path/to/openinterstate-data/source-cache/`, and Cargo cache is shared
-under `/path/to/openinterstate-data/cache/cargo/` so Rust builds are
-reused across PBF workspaces.
+- `bin/` local command-line entrypoint
+- `compose.yaml` Docker services for PostGIS and the build runner
+- `docker/runner/` tool image with Rust, osm2pgsql, osmium, and Python
+- `schema/` bootstrap SQL, derive SQL, and the osm2pgsql flex mapping
+- `crates/` Rust builders for the graph, corridors, and reference routes
+- `tooling/` release export and CI scripts
+- `datapackage.json` machine-readable schema for every public table
+- `schemas/` release manifest schema
+- `examples/` example consumer queries
 
-If you want release artifacts in a separate folder, set an explicit release
-root:
+## Contributing
 
-```bash
-./bin/openinterstate \
-  --data-parent /path/to/openinterstate-data \
-  --release-dir /path/to/openinterstate-data/releases \
-  build
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md). Naming, schema, and release-format
+review are the most useful contributions right now.
 
-If you need to pin an exact workspace path and bypass the SHA-derived layout,
-use `--data-dir` as an explicit override.
+## License
 
-When the source PBF, import mapping, derive inputs, and release exporter are
-unchanged, repeated builds now skip the already-current stages instead of
-re-downloading or rebuilding them.
-
-Fresh builds are faster too: the canonical prefilter/import now keeps only the
-motorway/trunk road context and POI data needed for Interstate derivation, and
-the downstream Rust graph builders stay focused on Interstate-labeled corridors
-instead of constructing a much broader national highway graph.
-
-## GitHub Actions Release Build
-
-The repo now carries a manual GitHub Actions release workflow at
-`.github/workflows/release-build.yml`.
-
-That workflow is shaped to fit standard public GitHub-hosted runners:
-
-1. download the raw `us-latest.osm.pbf` into short-lived runner storage
-2. upload only the filtered `~160 MB` import PBF plus source metadata
-3. rebuild PostGIS, derive tables, and export the release from that artifact
-4. optionally publish the archive, manifest, checksums, and source lineage to GitHub
-
-The raw source PBF is deleted after filtering and is never published as an
-artifact, so the persisted handoff between jobs stays small even though the
-prefilter job uses temporary local disk.
-
-The manual `workflow_dispatch` path targets the full U.S. source file. The
-`pull_request` path uses a smaller Rhode Island smoke-test extract so PR checks
-validate the workflow mechanics without paying the full release-build cost on
-every iteration.
-
-## Repo Map
-
-- `bin/`: the local command-line entrypoint
-- `compose.yaml`: Docker services for PostGIS and the build runner
-- `docker/runner/`: tool image with Rust, osm2pgsql, osmium, and Python
-- `schema/`: bootstrap SQL, derive SQL, and the osm2pgsql flex mapping
-- `tooling/`: release export and CI release scripts
-- `crates/core/`: shared Rust geometry and highway helpers
-- `crates/derive/`: Rust builders for graph, corridors, and reference routes
-- `datapackage.json`: machine-readable schema for every public table (Data Package standard)
-- `schemas/`: public manifest schemas
-- `examples/`: example consumer queries
-
-## Start Here
-
-- [Public table schema](datapackage.json), also rendered at https://openinterstate.org/schema
-- [Contributing](CONTRIBUTING.md)
-
-## Project Boundary
-
-OpenInterstate is the upstream interstate data layer. It does not define:
-
-1. consumer app packaging
-2. runtime response contracts for a specific client
-3. application-specific delivery formats
-
-## Public Surface
-
-The current public release contains:
-
-1. corridors
-2. corridor edges
-3. corridor exits
-4. exit aliases
-5. places
-6. exit-place links
-7. reference routes
-
-Drive-time reachability scores are published separately by
-`tldev/openinterstate-reachability`.
-
-The internal canonical database is broader than the public release. It keeps
-supporting highway context and POIs needed for derivation, but the exported
-release is narrowed back to Interstate corridors and official signed branch
-routes such as `I-35E`, `I-35W`, `I-69C`, `I-69E`, and `I-69W`.
-
-`exit_aliases` is part of the public surface, but it is currently emitted as an
-empty table until the standalone exit-alias normalization layer is populated.
-
-Project links:
-
-1. main repo: `https://github.com/tldev/openinterstate`
-2. website repo: `https://github.com/tldev/openinterstate.org`
-3. public site: `https://openinterstate.org`
+Code is MIT ([LICENSE](LICENSE)). Data releases are OpenStreetMap-derived and
+published under ODbL 1.0 ([DATA_LICENSE.md](DATA_LICENSE.md)).
